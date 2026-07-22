@@ -344,12 +344,72 @@
   tudo o resto), entrega real de alertas (Slack/email/PagerDuty), correção da corrida de thread
   presa (fica para `LiveBroker`).
 
+### Milestone 6 — artefactos construídos (2026-07-22), execução real pendente
+Diferente dos milestones 0–5: isto não pode ser marcado FEITO da mesma forma, porque o critério de
+sucesso real ("sobrevive semanas sem intervenção") só se prova no servidor real, ao longo do
+tempo, fora do alcance desta conversa — não é algo que um `pytest` ou uma verificação minha possa
+confirmar. O que existe agora: todos os ficheiros de deploy prontos e commitados; os passos no
+servidor (secção "Comandos... correstes no servidor" do `DEPLOY.md`) ficam por conta do dono.
+- **Docker Compose, dois serviços** (`Dockerfile`, `docker-compose.yml`, `docker/entrypoint.sh`):
+  `db` (postgres:16, volume nomeado `pgdata`) + `bot` (build local, corre `migrate.py` depois
+  `run_live.py` via `exec` no entrypoint para receber SIGTERM diretamente). **Nenhum dos dois
+  publica portas para o host** — `db` só é alcançável pelo `bot` pela rede interna do Compose, o
+  que também evita de raiz o problema conhecido de o Docker contornar regras do `ufw` em portas
+  publicadas (não há portas publicadas, logo não há nada para contornar). `PYTHONUNBUFFERED=1` no
+  Dockerfile — sem isto, `docker logs` podia mostrar output atrasado ou nada, por buffering do
+  Python quando não há TTY. Container do bot corre como utilizador não-root (`botuser`).
+- **`restart: unless-stopped` + `systemctl enable docker`** cobre crash de processo E reboot do
+  servidor sem intervenção manual — `unless-stopped` (não `always`) respeita uma paragem
+  deliberada (`docker compose stop`), só não reinicia sozinho nesse caso específico. Nenhum
+  systemd unit extra à volta do `docker compose up` — redundante dado que o daemon Docker mais a
+  política de restart já cobre os dois casos.
+- **Halt durável sobrevive sem código novo.** `risk_events` vive no volume `pgdata`, que não é
+  tocado por crash de container, reboot da VM, ou `docker compose up -d --build` — só
+  `docker compose down -v` apaga volumes (aviso explícito no `DEPLOY.md`: nunca correr isto neste
+  projeto). Mesma garantia já provada ao nível de teste no milestone 4
+  (`test_durable_halt_survives_restart_and_only_clears_via_clear_halt`), agora sob infraestrutura
+  real em vez de um laptop.
+- **Segredos**: `.env` do servidor gerado diretamente no servidor via SSH (nunca no laptop, nunca
+  em trânsito como ficheiro) — só `POSTGRES_PASSWORD`; `docker-compose.yml` interpola-o em ambos
+  os serviços e constrói `DATABASE_URL` a apontar para o hostname interno `db`, não `localhost`
+  (diferente do `.env` local — daí `.env.prod.example` separado do `.env.example` existente).
+  Zero mudanças a `bot/persistence/db.py` — continua só a ler `os.environ["DATABASE_URL"]`.
+- **Hardening**: só chave SSH (password auth e root login desligados), utilizador sudo não-root,
+  duas camadas de firewall (Hetzner Cloud Firewall na consola web + `ufw` no host — nenhuma
+  sozinha seria suficiente, juntas cobrem "bloqueado antes de chegar à VM" e "bloqueado no host"),
+  `unattended-upgrades` para patches automáticos, `fail2ban` contra tentativas SSH repetidas.
+  Passos manuais no servidor, documentados no `DEPLOY.md`, não código.
+- **Backup adicionado depois da primeira proposta de design** — pedido explícito do dono: a
+  primeira versão do design tinha isto como item futuro adiado; o dono corrigiu que "semanas de
+  sobrevivência" é exatamente o que se perde se o servidor morrer à semana 3 sem backup, então o
+  ledger/run_log/reconciliação (a própria evidência que o milestone existe para produzir)
+  desaparecia com ele. `docker/backup.sh`: `pg_dump` diário via cron do host (não um serviço
+  Compose extra) para `~/trading-bot-backups/`, rotação simples (últimos 7). Cobre
+  crash/corrupção/erro humano — **não** cobre perda total do disco/servidor, que precisaria de
+  cópia off-site, deixado deliberadamente como item futuro (documentado, não escondido).
+- **Smoke test de conectividade promovido a passo explícito do runbook** — segundo pedido do dono:
+  a proposta original mencionava o risco de a Binance bloquear IPs de cloud providers como nota de
+  rodapé; passou a passo 7 do `DEPLOY.md`, correstes imediatamente a seguir ao `docker compose up`,
+  antes de confiar em mais nada. Testa REST (`fetch_history`) e WebSocket (`watch_ohlcv` direto,
+  sem esperar por um fecho de bar real — que podia demorar até uma hora) separadamente. Se
+  bloqueado, o fallback já estava planeado (Kraken, MiCA) — o ponto é descobrir isso no minuto um.
+- **`DEPLOY.md`**: runbook completo, passo a passo, com separação explícita entre "ficheiros deste
+  repo" e "comandos correstes no servidor". Cobre: criação do servidor, hardening, Docker, clone +
+  `.env`, subida do stack, smoke test, verificação, backups, observabilidade remota (logs,
+  queries a `run_log`/`risk_events`/`reconciliation_checks`, `clear_halt.py` via `docker compose
+  exec`), redeploy, recuperação total do zero, e a lista explícita do que fica fora de âmbito.
+- **Nenhuma mudança a lógica do bot** — só empacotamento. `bot/`, `scripts/run_live.py` intocados.
+
 ## TODO imediato
-- [ ] Milestone 6: deploy VPS, correr semanas em paper. Sucesso = uptime + reconciliação, não P&L
-      (aguarda go-ahead do dono).
+- [ ] Milestone 6 (continuação): dono corre o runbook (`DEPLOY.md`) no servidor real — criação,
+      hardening, deploy, smoke test, backups agendados. Confirmar de volta para marcar o roadmap
+      em `CLAUDE.md` como feito; até lá o checkbox fica por marcar porque "sobrevive semanas" não é
+      algo que eu consiga verificar a partir daqui.
 - [ ] (Dívida técnica) Corrida de thread presa não-defendida em `LiveRunner` — ver nota no
       milestone 5. Resolver a sério só faz sentido com `LiveBroker`.
 - [ ] (Dívida técnica) `REVOKE UPDATE, DELETE ... FROM app_role` quando existir um role de
       aplicação não-superuser — ver nota no milestone 3.
+- [ ] (Dívida técnica, deliberada) Backup off-site — só local no servidor por agora, ver nota no
+      milestone 6.
 - [ ] (Futuro, pré-requisito do gate) Split out-of-sample / walk-forward no backtester.
 - [ ] (Futuro) Avaliar Kraken (MiCA) como venue de dados/execução em alternativa à Binance.

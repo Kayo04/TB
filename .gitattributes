@@ -1,0 +1,4 @@
+# Shell scripts get COPYed straight into a Linux container build context --
+# CRLF line endings would break the shebang ("bad interpreter") no matter
+# what a contributor's local core.autocrlf is set to.
+docker/*.sh text eol=lf

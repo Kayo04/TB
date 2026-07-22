@@ -33,5 +33,10 @@ Se o bot estiver halted (kill-switch ligado), só um humano o desbloqueia:
 
 Correr o loop autónomo (paper, 24/7, BTC/USDT 1h): `python scripts/run_live.py`.
 
+## Deploy (VPS, 24/7 real)
+Ver `DEPLOY.md` para o runbook completo — Docker Compose (`bot` + `db`, sem portas publicadas),
+`restart: unless-stopped`, backups diários, hardening do servidor, smoke test de conectividade à
+exchange, e observabilidade remota.
+
 ## Princípio central
 "Está a funcionar" = corre sozinho, fiável, reconciliável — **não** "deu dinheiro".
