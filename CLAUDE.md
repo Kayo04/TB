@@ -47,7 +47,7 @@ reconciliação** — nunca com o saldo.
 - [x] **2** — Execução em paper com idempotência. Ver `bot/execution/`.
 - [x] **3** — Persistência Postgres (ledger/posições/ordens) + reconciliação. Ver `bot/persistence/`.
 - [x] **4** — Risk layer + kill-switch. Ver `bot/risk/`.
-- [ ] **5** — Loop autónomo 24/7 + observabilidade.
+- [x] **5** — Loop autónomo 24/7 + observabilidade. Ver `bot/orchestration/`.
 - [ ] **6** — Deploy VPS; correr semanas em paper. Sucesso = uptime + reconciliação, não P&L.
 
 ## Gates (bloqueiam avanço)

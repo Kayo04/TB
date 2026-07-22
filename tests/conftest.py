@@ -18,7 +18,7 @@ def db_conn():
     conn = get_connection(autocommit=True)
     run_migrations(conn)
     conn.execute(
-        "TRUNCATE TABLE fills, orders, reconciliation_checks, risk_events, equity_snapshots "
+        "TRUNCATE TABLE fills, orders, reconciliation_checks, risk_events, equity_snapshots, run_log "
         "RESTART IDENTITY CASCADE"
     )
     yield conn

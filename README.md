@@ -24,11 +24,14 @@ Se não existir, ver `.env.example` para o formato de `DATABASE_URL` (o `.env` r
 Estrutura: `bot/data` (histórico paginado + live), `bot/strategy` (interface `Strategy`),
 `bot/backtest` (motor), `bot/execution` (paper broker + idempotência), `bot/persistence`
 (ledger append-only, posição derivada, reconciliação), `bot/risk` (kill-switch durável,
-`RiskGate` fail-closed, limites configuráveis).
+`RiskGate` fail-closed, limites configuráveis), `bot/orchestration` (loop autónomo bar-aligned,
+`run_log` append-only, alertas).
 Ver `CLAUDE.md` para a arquitetura completa.
 
 Se o bot estiver halted (kill-switch ligado), só um humano o desbloqueia:
 `python scripts/clear_halt.py "<nome>" "<motivo>"`.
+
+Correr o loop autónomo (paper, 24/7, BTC/USDT 1h): `python scripts/run_live.py`.
 
 ## Princípio central
 "Está a funcionar" = corre sozinho, fiável, reconciliável — **não** "deu dinheiro".

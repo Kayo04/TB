@@ -263,11 +263,92 @@
   confirmado halted → cleared → not halted.
 - Strategy e o motor de backtest continuam sem qualquer import de `bot.risk` — inalterado.
 
+### Milestone 5 — FEITO (2026-07-22)
+- **Loop bar-aligned, `stream()` como relógio.** `LiveRunner.run_forever()` é
+  `async for bar in data_source.stream(symbol, timeframe): ...` — nenhum scheduler novo. Um
+  timeframe de 1h só produz uma decisão nova quando um bar fecha, e `stream()` (milestone 1) já é
+  exatamente esse gatilho (websocket `watch_ohlcv`, com fallback REST atrás da mesma interface).
+  Um ciclo completo por bar: acrescenta ao buffer rolante → `compute_signal` → deriva transição →
+  `RiskGate.submit_order` → `reconcile()` + `handle_reconciliation()` (SEMPRE, não só quando há
+  ordem) → `check_daily_drawdown()` (SEMPRE também) → escreve uma linha em `run_log`. Fecha
+  explicitamente o TODO deixado pelo milestone 4: reconciliação e drawdown agora têm cadência
+  periódica real, não dependem de uma ordem acontecer.
+- **Buffer em memória, deliberadamente não persistido.** `seed_from_history()` reconstrói via
+  `fetch_history(since=now - warmup_bars*timeframe)` em todo arranque (frio ou restart) — barato,
+  dados públicos, sem estado interno necessário. Só o que NÃO pode ser re-derivado de um feed
+  público (posições/ordens/halt) vive em Postgres.
+- **Sem ciclos sobrepostos, por construção.** `async for` sequencial: o gerador só produz o
+  próximo bar quando o processamento do anterior já libertou o controlo. Timeout por ciclo
+  (default 30s) via `asyncio.wait_for(asyncio.to_thread(_run_cycle_sync, bar), timeout=...)` — o
+  corpo do ciclo é síncrono (Strategy e chamadas a Postgres não têm `await`), por isso corre numa
+  thread à parte só para que `wait_for` tenha um ponto real onde poder desistir; sem isto o
+  timeout seria decorativo, nunca interromperia nada.
+- **Falha de stream vs. falha de ciclo, tratadas de forma diferente.** Falha do próprio `stream()`
+  (queda de ligação) é existencial — sem stream, nenhum bar futuro chega — por isso tem retry com
+  backoff exponencial (5s→300s, default) e reconecta. Falha de UM ciclo (bug, dado mau, timeout)
+  não é retentada para esse bar — fica registada e o loop avança para o próximo bar assim que
+  chegar. Decisão fail-closed deliberada: falhar = não negociar neste ciclo, nunca negociar com
+  estado parcial. Nenhum caminho de código consegue chamar `submit_order()` depois de uma exceção
+  algures antes dele no mesmo ciclo — o `try/except/finally` é único, não há recuperação parcial.
+- **Bug real apanhado e corrigido durante a construção**: um timeout do `wait_for` não produzia,
+  por si só, nenhuma linha em `run_log` — a thread abandonada só regista (no seu próprio
+  `finally`) quando eventualmente terminar, e nessa altura pode ter tido sucesso, apagando
+  silenciosamente o facto de o loop já ter desistido dela. Corrigido: o ramo `except
+  asyncio.TimeoutError` em `run_forever` regista o ciclo como falhado imediatamente e de forma
+  durável, sem depender do que a thread abandonada acabe por fazer. Distinto de qualquer outra
+  exceção (essas já passam pelo `finally` do próprio `_run_cycle_sync` antes de propagar — registar
+  outra vez a duplicava). Teste `test_hung_cycle_hits_timeout_and_loop_moves_on` falhou primeiro
+  com o bug real, não só depois de ajustado — a thread tardia reescrevia a linha com
+  `'no_transition'`, mascarando o timeout.
+- **Corrida não-defendida, documentada e não corrigida (dívida técnica proporcional).** Uma thread
+  verdadeiramente presa não pode ser morta à força em Python; continua a correr e pode, no caso
+  patológico, ainda chamar `submit_order()` "fora de banda" depois do loop já ter avançado,
+  correndo em paralelo com o ciclo seguinte na mesma ligação partilhada. Com ciclos ~1h à parte e
+  timeout default de 30s, a janela é desprezável na prática; em paper o pior caso é inofensivo (a
+  dedupe de `client_order_id` do milestone 2/3 apanha uma ordem duplicada de qualquer forma). Só
+  se torna um problema real a resolver quando existir um `LiveBroker`, com âmbito próprio nessa
+  altura — não corrigido aqui, decisão deliberada, mesmo espírito do `REVOKE` adiado no
+  milestone 3.
+- **Observabilidade**: log estruturado por ciclo via `logging` stdlib (sem dependência nova) para
+  stdout. `run_log` (migração `0003_run_log.sql`, append-only, mesma convenção de todas as outras
+  tabelas) — uma linha por tentativa de ciclo, sucesso ou falha, escrita a partir de um `finally`
+  para nunca ser saltada; é a fonte de dados pretendida para o futuro dashboard (não construído
+  aqui). `AlertSink` Protocol + `LogAlertSink` (`logger.critical`) — seam real, entrega a sério
+  fica para mais tarde, mesmo padrão de `ExternalPositionSource`/`MarkPriceSource`. Disparado só
+  na transição halt False→True dentro de um ciclo (edge-triggered, comparando
+  `kill_switch.is_halted()` no início e no fim do ciclo) — nunca em todos os ciclos enquanto já
+  halted.
+- **Decisão do dono: o loop continua a correr enquanto halted.** Continua a consumir bars, a
+  tentar `reconcile()`, a registar ciclos — só `submit_order()` é rejeitado, barato, pelo
+  `RiskGate`, sempre. Um processo que sai ao ficar halted é indistinguível de um crash para quem
+  está a monitorizar; "vivo, halted, à espera de um humano" nos logs é o estado observável certo
+  e bate com o critério de sucesso do CLAUDE.md ("saber QUANDO parte").
+- **`bot/orchestration/`**: `runner.py` (`LiveRunner`, `RunnerConfig`), `run_log.py`
+  (`record_cycle`), `alerts.py` (`AlertSink`, `LogAlertSink`). `scripts/run_live.py` novo —
+  mesmos defaults do `run_backtest.py` (BTC/USDT, 1h, binance, MA crossover 20/50): continua só a
+  provar o motor, não uma alegação de edge.
+- **38/38 testes a passar**, incluindo os 4 pedidos especificamente isolados: falha de ciclo a
+  saltar o bar sem submeter ordem e mesmo assim registada em `run_log`
+  (`test_cycle_failure_skips_bar_no_order_submitted_but_still_logged`), restart simulado a
+  retomar de estado durável sem ordem duplicada — testado tanto pela deteção de posição correta
+  (sem sequer tentar reenviar) como pelo caso pior direto via dedupe de `client_order_id`
+  (`test_restart_resumes_from_durable_state_no_duplicate_order`), e ciclo preso a atingir o
+  timeout com o loop a avançar (`test_hung_cycle_hits_timeout_and_loop_moves_on`). Testes de
+  orquestração recorridos 5x isolados para excluir flakiness relacionada com timing — estáveis.
+  Testes usam doubles (`ScriptedStrategy`, `FakeDataSource`) que satisfazem os Protocols
+  `Strategy`/`MarketDataSource` em vez de `MACrossoverStrategy`/`CcxtDataSource` reais — teste mais
+  honesto do desacoplamento do que importar uma implementação concreta.
+- Strategy e o motor de backtest continuam sem qualquer import de `bot.orchestration` — e
+  vice-versa, `bot.orchestration` nunca importa `bot.backtest`.
+- **Não construído (por desenho):** o dashboard Next.js em si (só a fonte de dados, `run_log` +
+  tudo o resto), entrega real de alertas (Slack/email/PagerDuty), correção da corrida de thread
+  presa (fica para `LiveBroker`).
+
 ## TODO imediato
-- [ ] Milestone 5: loop autónomo 24/7 + observabilidade — liga `reconcile()` +
-      `checks.handle_reconciliation()` + `check_daily_drawdown()` a um ciclo periódico real (hoje
-      só correm quando algo chama `RiskGate.submit_order()`); fornece `MarkPriceSource` real a
-      partir dos dados ao vivo (aguarda go-ahead do dono).
+- [ ] Milestone 6: deploy VPS, correr semanas em paper. Sucesso = uptime + reconciliação, não P&L
+      (aguarda go-ahead do dono).
+- [ ] (Dívida técnica) Corrida de thread presa não-defendida em `LiveRunner` — ver nota no
+      milestone 5. Resolver a sério só faz sentido com `LiveBroker`.
 - [ ] (Dívida técnica) `REVOKE UPDATE, DELETE ... FROM app_role` quando existir um role de
       aplicação não-superuser — ver nota no milestone 3.
 - [ ] (Futuro, pré-requisito do gate) Split out-of-sample / walk-forward no backtester.
