@@ -17,6 +17,9 @@ from bot.persistence.migrate import run_migrations
 def db_conn():
     conn = get_connection(autocommit=True)
     run_migrations(conn)
-    conn.execute("TRUNCATE TABLE fills, orders, reconciliation_checks RESTART IDENTITY CASCADE")
+    conn.execute(
+        "TRUNCATE TABLE fills, orders, reconciliation_checks, risk_events, equity_snapshots "
+        "RESTART IDENTITY CASCADE"
+    )
     yield conn
     conn.close()

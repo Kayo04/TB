@@ -195,9 +195,79 @@
   resposta a divergência além de log/registo (kill-switch é milestone 4), reconciliação
   agendada/contínua (precisa do loop de orquestração, milestone 5).
 
+### Milestone 4 — FEITO (2026-07-22)
+- **`RiskGate` (`bot/risk/gate.py`) é um `Broker` que envolve um `Broker`** — mesmo protocolo
+  (`submit_order`, `position`), mesmo truque de seam que `ExternalPositionSource` já usava para
+  reconciliação. Um chamador futuro (orquestração, milestone 5) segura "um `Broker`" sem saber
+  nem precisar de saber se é o `PaperBroker` cru ou o `RiskGate` à volta dele.
+- **Fail-closed é a regra central, aplicada em dois pontos concretos, não só documentada:**
+  1. `kill_switch.is_halted()` — se a própria leitura falhar (ligação em baixo, etc.), devolve
+     `True`. Não-conseguir-ler-estado e estar-halted são tratados como o mesmo caso.
+  2. `RiskGate.submit_order()` — toda a avaliação (kill-switch + checks) corre dentro de um único
+     `try/except`; qualquer exceção de qualquer check é convertida em bloqueio, nunca propagada
+     nem tratada como "permitir implícito". O broker por baixo nunca é chamado nesse caminho.
+  Verificado por comportamento real, não só por design: `test_risk_check_exception_defaults_to_block`
+  (check a levantar exceção → ordem rejeitada, zero linhas em `orders`) e
+  `test_is_halted_returns_true_when_read_fails` (ligação fechada → `True`). Diferente do
+  grep-test rejeitado no milestone 3 — isto testa comportamento em runtime, não padrão estático
+  no código-fonte.
+- **Kill-switch durável**: tabela `risk_events` (append-only, mesmo padrão do ledger/
+  `reconciliation_checks`) — `event_type` `'halt'`/`'clear'`, estado atual = tipo da linha mais
+  recente. Sobrevive a restart por construção: nada vive em memória, `is_halted()` lê sempre do
+  Postgres. `clear_halt()` só é chamado a partir de `scripts/clear_halt.py` (CLI manual,
+  `cleared_by`/`note` obrigatórios e não-vazios) — nenhum caminho automático do código chama
+  `clear_halt()`, por isso um bot halted que reinicia continua halted até intervenção humana.
+  Testado: halt → nova ligação (restart simulado) → continua halted → `RiskGate` novo nessa
+  ligação rejeita uma ordem por "kill switch" → só `clear_halt` desbloqueia, visível de qualquer
+  ligação depois.
+- **Dois tipos de resposta, deliberadamente diferentes:**
+  - **Rejeição por-ordem** (bot continua a correr): `max_position_size` (default 1.0 unidade por
+    símbolo — sizing real por risco continua adiado até existir uma estratégia real; `qty`
+    placeholder mantém-se 1.0) e `max_orders_per_period` (default 10/1h, guarda contra um bug a
+    disparar ordens em loop, não uma restrição de rotina). Uma ordem rejeitada não mexe posição
+    nem halted; a próxima ordem dentro dos limites continua a passar — testado explicitamente
+    (`test_max_position_size_rejects_order_but_bot_keeps_running`).
+  - **Halt ao nível do bot** (durável, para tudo até intervenção humana): `max_daily_drawdown`
+    (default 5%, mark-to-market — ver abaixo) e divergência de reconciliação
+    (`checks.handle_reconciliation`, alimentado pelo `list[Divergence]` que `reconcile()` já
+    devolvia no milestone 3). `reconciliation.py` continua **sem qualquer import de `bot.risk`**
+    — a dependência vai de risk para o tipo `Divergence`, nunca ao contrário; reconciliação
+    continua a não saber que halting existe.
+  Todos os três limites são `RiskLimits`, configuráveis com defaults conservadores — não
+  hardcoded, para poderem ser afinados depois de ver comportamento real.
+- **Drawdown diário: mark-to-market, não só realizado.** Decisão explícita: para uma estratégia
+  sempre-em-posição (MA crossover), um check só-realizado seria cego a perdas não realizadas
+  exatamente quando um halt mais importa. `equity_snapshots` (append-only) regista, a cada
+  avaliação, `cash_flow` (fold do dia sobre `fills`, líquido de fees) + `mark_to_market`
+  (posição × preço atual) = `total_equity`. `mark_prices` é passado pelo chamador
+  (`MarkPriceSource` Protocol, `StaticMarkPriceSource` como implementação trivial) — o risk layer
+  não importa `bot.data`, mesmo desacoplamento que `ExternalPositionSource`. Drawdown = pico do
+  dia (UTC) menos equity atual, sobre o pico; breach chama `kill_switch.trip_halt()` a partir de
+  dentro do próprio check. Testado: pico 100 (preço 200) → crash para preço 90 (equity -10,
+  drawdown 110%) → halt disparado com `triggered_by='max_daily_drawdown'`, e uma ordem
+  completamente inofensiva submetida a seguir é rejeitada só porque o kill-switch está ligado
+  (`test_drawdown_breach_trips_durable_halt`) — prova que o halt é global, não por-ordem.
+- **`Fill` ganhou campo `reason: Optional[str] = None`** (`bot/execution/base.py`) — motivo
+  visível numa ordem rejeitada; default `None` mantém compatível com todas as construções
+  existentes de `Fill`.
+- **Migração `0002_risk_layer.sql`**: `risk_events`, `equity_snapshots`, índices por
+  `created_at`/`recorded_at`. Aplicada e reconfirmada idempotente. Enforcement append-only:
+  mesma nota do milestone 3 — convenção revista por review, `REVOKE` continua dívida técnica.
+- **`bot/risk/`**: `base.py` (`RiskDecision`, `RiskLimits`), `kill_switch.py` (`is_halted`,
+  `trip_halt`, `clear_halt`), `checks.py` (os quatro checks), `gate.py` (`RiskGate`,
+  `MarkPriceSource`, `StaticMarkPriceSource`). `scripts/clear_halt.py` novo.
+- **35/35 testes a passar**, incluindo os 4 pedidos especificamente isolados: os dois testes
+  fail-closed, halt durável a sobreviver a restart só limpo pelo CLI, `max_position_size` a
+  rejeitar uma ordem sem parar o bot, e um breach de drawdown a disparar o halt durável. Testado
+  também de ponta a ponta fora do pytest: `scripts/clear_halt.py` correu contra um halt real,
+  confirmado halted → cleared → not halted.
+- Strategy e o motor de backtest continuam sem qualquer import de `bot.risk` — inalterado.
+
 ## TODO imediato
-- [ ] Milestone 4: risk layer (position sizing, limites, kill-switch) — usa `reconcile()` como
-      um dos possíveis gatilhos de halt (aguarda go-ahead do dono).
+- [ ] Milestone 5: loop autónomo 24/7 + observabilidade — liga `reconcile()` +
+      `checks.handle_reconciliation()` + `check_daily_drawdown()` a um ciclo periódico real (hoje
+      só correm quando algo chama `RiskGate.submit_order()`); fornece `MarkPriceSource` real a
+      partir dos dados ao vivo (aguarda go-ahead do dono).
 - [ ] (Dívida técnica) `REVOKE UPDATE, DELETE ... FROM app_role` quando existir um role de
       aplicação não-superuser — ver nota no milestone 3.
 - [ ] (Futuro, pré-requisito do gate) Split out-of-sample / walk-forward no backtester.

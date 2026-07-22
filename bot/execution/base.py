@@ -54,6 +54,7 @@ class Fill:
     fee: Optional[float]
     effective_ts: pd.Timestamp
     filled_ts: Optional[pd.Timestamp]
+    reason: Optional[str] = None  # set for status="rejected" -- which check blocked it and why (bot.risk)
 
 
 class Broker(Protocol):

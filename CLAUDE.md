@@ -46,7 +46,7 @@ reconciliação** — nunca com o saldo.
 - [x] **1** — Interface `Strategy` + camada de dados ao vivo. Ver `bot/strategy/`, `bot/data/`.
 - [x] **2** — Execução em paper com idempotência. Ver `bot/execution/`.
 - [x] **3** — Persistência Postgres (ledger/posições/ordens) + reconciliação. Ver `bot/persistence/`.
-- [ ] **4** — Risk layer + kill-switch.
+- [x] **4** — Risk layer + kill-switch. Ver `bot/risk/`.
 - [ ] **5** — Loop autónomo 24/7 + observabilidade.
 - [ ] **6** — Deploy VPS; correr semanas em paper. Sucesso = uptime + reconciliação, não P&L.
 

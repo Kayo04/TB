@@ -23,8 +23,12 @@ Se não existir, ver `.env.example` para o formato de `DATABASE_URL` (o `.env` r
 
 Estrutura: `bot/data` (histórico paginado + live), `bot/strategy` (interface `Strategy`),
 `bot/backtest` (motor), `bot/execution` (paper broker + idempotência), `bot/persistence`
-(ledger append-only, posição derivada, reconciliação).
+(ledger append-only, posição derivada, reconciliação), `bot/risk` (kill-switch durável,
+`RiskGate` fail-closed, limites configuráveis).
 Ver `CLAUDE.md` para a arquitetura completa.
+
+Se o bot estiver halted (kill-switch ligado), só um humano o desbloqueia:
+`python scripts/clear_halt.py "<nome>" "<motivo>"`.
 
 ## Princípio central
 "Está a funcionar" = corre sozinho, fiável, reconciliável — **não** "deu dinheiro".
