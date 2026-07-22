@@ -50,8 +50,52 @@
 - Estes dois pontos são pré-requisitos de infraestrutura do backtester, não da estratégia.
   Nenhuma estratégia deve ser considerada "aprovada" ou "reprovada" pelo gate até ambos existirem.
 
+### Milestone 1 — FEITO (2026-07-22)
+- `git init` + commit de baseline antes do refactor (restauro possível se algo correr mal).
+- Reestruturado para pacote `bot/` (`data/`, `strategy/`, `backtest/`) + `scripts/run_backtest.py`
+  + `tests/`. `backtester.py` (flat, raiz) removido — substituído por `bot/backtest/engine.py`.
+  `execution/`, `persistence/`, `risk/`, `orchestration/` **não** criados ainda — só quando os
+  respetivos milestones começarem.
+- Interface `Strategy` (`bot/strategy/base.py`): `compute_signal(df) -> pd.Series` pura, mais
+  `warmup_bars()` como **limite superior rígido de memória** (não só "válido a partir de N
+  barras") — o sinal na barra t só pode depender das últimas `warmup_bars` barras fechadas.
+  Estratégias recursivas/expanding-window (ex: EMA a partir da barra 0) violam o contrato e
+  quebram a paridade backtest/live silenciosamente; têm de ser reformuladas para janela fixa ou
+  ficam de fora desta interface. `MACrossoverStrategy` movida para `bot/strategy/ma_crossover.py`
+  como exemplo de estratégia bounded-window válida.
+- **Teste de paridade** (`tests/test_strategy.py::test_vectorized_incremental_parity`): compara,
+  barra a barra, o `compute_signal` vectorizado (histórico completo) com o incremental (buffer
+  rolante limitado a `warmup_bars`, tal como o runner ao vivo fará). **7/7 testes passam**,
+  incluindo paridade para MA 20/50 e MA 5/10. Este teste é a garantia real por trás do critério
+  de sucesso do CLAUDE.md ("comportamento ao vivo bate certo com o backtest") — a interface só
+  torna a garantia possível, o teste é que a verifica.
+- Camada de dados (`bot/data/`): `MarketDataSource` Protocol com `fetch_history` (histórico,
+  paginado via `since`) e `stream` (live, async, só barras FECHADAS). `CcxtDataSource`
+  implementa ambos.
+  - `fetch_history`: loop `since`-forward, dedupe por timestamp, respeita `rateLimit`. Testado
+    offline com exchange falso (`tests/test_data.py`, 3 testes) e confirmado end-to-end contra
+    binance real: `scripts/run_backtest.py` agora traz as **1500 barras** pedidas (antes só
+    1000, limite de um único pedido). Bug apanhado e corrigido durante os testes: o filtro de
+    paginação usava `< until` (estrito) mas o filtro final usava `<= until` (inclusivo) — a
+    barra exatamente em `until` era descartada silenciosamente antes de chegar ao filtro final.
+  - `stream`: **verificado no build (2026-07-22) que `ccxt.pro` websocket (`watch_ohlcv`)
+    funciona para OHLCV público da binance sem API key e sem gate de licença** — testado
+    ao vivo, recebeu barra em ~15s. Por isso o caminho **websocket é o usado**, não o fallback.
+    Fallback REST short-poll (`_stream_poll`, atrás do mesmo `stream()`) implementado e
+    disponível para exchanges/timeframes sem `watchOHLCV`, mas não é o que corre hoje.
+- Resultado do `scripts/run_backtest.py` com histórico completo (1500 barras, BTC/USDT 1h,
+  binance): retorno_total -4.54%, buy_and_hold -15.3%, sharpe -0.98, max_drawdown -10.13%,
+  n_trades 13. Ainda ~62 dias — mesmo aviso de amostra pequena de antes aplica-se; não é uma
+  avaliação da estratégia, só prova que a paginação funciona ponta-a-ponta.
+
+### Nota: venue de dados/execução (2026-07-22)
+- Binance mantém-se como fonte de dados por agora (funciona, sem fricção). Mas tanto a fonte de
+  dados como a futura venue de execução podem vir a mudar para uma exchange **autorizada MiCA**
+  (ex: Kraken), relevante para o gate de dinheiro real e residência em Portugal (ver Gates no
+  CLAUDE.md). Decisão adiada — não bloqueia milestone 1, que é agnóstico à exchange por design
+  (`CcxtDataSource(exchange=...)`).
+
 ## TODO imediato
-- [ ] Milestone 1: interface `Strategy` + camada de dados (histórico paginado + live) — design
-      aprovado pelo dono, a construir a seguir.
-- [ ] (Futuro, pré-requisito do gate) Paginação `since` no fetch histórico.
+- [ ] Milestone 2: execução em paper com idempotência (aguarda go-ahead do dono).
 - [ ] (Futuro, pré-requisito do gate) Split out-of-sample / walk-forward no backtester.
+- [ ] (Futuro) Avaliar Kraken (MiCA) como venue de dados/execução em alternativa à Binance.

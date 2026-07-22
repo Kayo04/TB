@@ -42,8 +42,8 @@ reconciliação** — nunca com o saldo.
 7. **Observabilidade** — logs estruturados + alertas (saber QUANDO parte; vai partir).
 
 ## Roadmap (atualizar sempre em PROGRESS.md)
-- [x] **0** — Backtester honesto (sem look-ahead, com custos). Ver `backtester.py`.
-- [ ] **1** — Interface `Strategy` + camada de dados ao vivo.
+- [x] **0** — Backtester honesto (sem look-ahead, com custos). Ver `bot/backtest/engine.py`.
+- [x] **1** — Interface `Strategy` + camada de dados ao vivo. Ver `bot/strategy/`, `bot/data/`.
 - [ ] **2** — Execução em paper com idempotência.
 - [ ] **3** — Persistência Postgres (ledger/posições/ordens) + reconciliação.
 - [ ] **4** — Risk layer + kill-switch.

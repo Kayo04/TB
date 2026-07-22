@@ -6,10 +6,11 @@ Ver `CLAUDE.md` para o objetivo, arquitetura, roadmap e regras. Estado atual em 
 ## Arranque rápido
 ```bash
 pip install -r requirements.txt
-python backtester.py            # corre em dados sintéticos (prova o motor)
+python scripts/run_backtest.py  # MA crossover (20/50) em BTC/USDT real, via binance
+pytest tests/                    # inclui o teste de paridade vectorizado vs incremental
 ```
-Para dados reais, no `__main__` do `backtester.py` troca `synthetic_ohlcv()` por
-`fetch_ohlcv_ccxt("BTC/USDT", "1h", 1500)`.
+Estrutura: `bot/data` (histórico paginado + live), `bot/strategy` (interface `Strategy`),
+`bot/backtest` (motor). Ver `CLAUDE.md` para a arquitetura completa.
 
 ## Princípio central
 "Está a funcionar" = corre sozinho, fiável, reconciliável — **não** "deu dinheiro".

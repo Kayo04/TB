@@ -1,4 +1,5 @@
 ccxt
 pandas
 numpy
+pytest
 # adicionar mais tarde (milestone 3): SQLAlchemy, psycopg[binary]
