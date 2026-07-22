@@ -2,4 +2,6 @@ ccxt
 pandas
 numpy
 pytest
-# adicionar mais tarde (milestone 3): SQLAlchemy, psycopg[binary]
+psycopg[binary]
+python-dotenv
+# adicionar mais tarde (milestone 3): SQLAlchemy (se necessário além de psycopg puro)

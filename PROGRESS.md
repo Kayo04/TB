@@ -95,7 +95,52 @@
   CLAUDE.md). Decisão adiada — não bloqueia milestone 1, que é agnóstico à exchange por design
   (`CcxtDataSource(exchange=...)`).
 
+### Milestone 2 — FEITO (2026-07-22)
+- **Infra Postgres**: sem Docker nem Postgres a correr na máquina. Achado relevante: havia um
+  PostgreSQL 16 nativo (`C:\Program Files\PostgreSQL\16`), mas o `installation_summary.log`
+  mostra que o **servidor foi desinstalado em 2024-06-29** — só ficou a pasta `data` órfã (do
+  projeto MyBody, presumivelmente). Não foi tocada. Dono instalou Docker Desktop (fora do meu
+  alcance — precisa admin/reboot). A partir daí:
+  - Container `trading-bot-postgres` (imagem `postgres:16`), volume nomeado
+    `trading-bot-pgdata` (persiste entre restarts do container), porta 5432, DB `trading_bot`.
+  - Password gerada aleatoriamente, `DATABASE_URL` escrito em `.env` (gitignored, nunca
+    commitado; `.env.example` no repo documenta o formato).
+  - Ligação verificada com `psycopg` antes de escrever qualquer código do milestone 2.
+- **Decisão de sequenciamento confirmada: opção (b), Postgres agora**, não SQLite. Razão do
+  dono: testar idempotência contra SQLite e só validar concorrência/transações contra Postgres
+  no milestone 3 seria testar a semântica errada — exatamente a classe de falha que este
+  milestone existe para apanhar.
+- **Tabela `orders`** (`bot/execution/db.py`), mínima mas com `symbol`/`side`/`qty` incluídos
+  (além de `client_order_id`/`status`/`filled_price`/`filled_ts`) para permitir reconstruir
+  posição depois de um restart — dedupe sozinho não chega para isso. `status` inclui `'pending'`
+  reservado para um futuro `LiveBroker`; `PaperBroker` nunca o escreve.
+- **Fronteira de transação**: o fill do `PaperBroker` é sintético e totalmente calculável em
+  memória antes de qualquer I/O — por isso "registar o ID" e "registar o fill" são a MESMA
+  escrita: um único `INSERT ... ON CONFLICT (client_order_id) DO NOTHING ... RETURNING`. Nunca
+  existe uma linha `'pending'` escrita por este broker, logo não há janela de crash que deixe
+  uma ordem a meio. Isto é uma simplificação específica do paper — um `LiveBroker` real (fill
+  não é conhecido antes da chamada à venue) vai precisar do padrão clássico de duas fases
+  (registar `pending` -> chamar a venue -> confirmar), daí o `status` já ter espaço para isso.
+- **`bot/execution/`**: `base.py` (Broker Protocol, `Order`/`Fill`/`Transition`), `order_ids.py`
+  (`make_client_order_id` — única implementação, partilhada por qualquer broker futuro),
+  `transitions.py` (`diff_transitions` com `prior_position` explícito para o caso de restart a
+  meio de posição, `order_from_transition`), `db.py`, `paper_broker.py`.
+- **21/21 testes a passar** (`pytest tests/`), incluindo os 5 acordados contra Postgres real:
+  clean replay, tentativa abortada (rollback simulando crash antes do commit), crash depois do
+  commit mas antes do chamador ver o resultado, submissão concorrente duplicada (8 threads, só
+  uma linha `filled`), e reconstrução de posição a partir do Postgres num `PaperBroker` novo.
+  Teste de concorrência corrido 10x isolado para excluir flakiness — estável nas 10.
+- **Bug real apanhado durante os testes** (não no `PaperBroker`, no próprio teste): as ligações
+  criadas manualmente nas threads do teste de concorrência não tinham `row_factory=dict_row`,
+  causando `TypeError` ao aceder a `row["symbol"]`. Corrigido para usar o helper partilhado
+  `get_connection()` em vez de `psycopg.connect()` cru — o tipo de inconsistência que o helper
+  único existe para evitar.
+- `qty` continua fixo em 1.0 (placeholder) — sizing é o milestone 4 (risk layer), não decidido
+  aqui. Broker construído e testado isoladamente; ainda não está ligado a um loop de trading
+  real (isso é o milestone 5, orquestração).
+
 ## TODO imediato
-- [ ] Milestone 2: execução em paper com idempotência (aguarda go-ahead do dono).
+- [ ] Milestone 3: persistência Postgres completa (ledger/posições/ordens) + reconciliação —
+      migrar `orders` da tabela mínima atual para o schema completo (aguarda go-ahead do dono).
 - [ ] (Futuro, pré-requisito do gate) Split out-of-sample / walk-forward no backtester.
 - [ ] (Futuro) Avaliar Kraken (MiCA) como venue de dados/execução em alternativa à Binance.
