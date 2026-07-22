@@ -35,6 +35,7 @@ class Transition:
 @dataclass(frozen=True)
 class Order:
     client_order_id: str
+    strategy_name: str
     symbol: str
     side: Side
     qty: float

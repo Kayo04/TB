@@ -44,6 +44,7 @@ def order_from_transition(
     side = "buy" if transition.to_position > transition.from_position else "sell"
     return Order(
         client_order_id=client_order_id,
+        strategy_name=strategy_name,
         symbol=transition.symbol,
         side=side,
         qty=qty,

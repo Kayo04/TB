@@ -139,8 +139,66 @@
   aqui. Broker construído e testado isoladamente; ainda não está ligado a um loop de trading
   real (isso é o milestone 5, orquestração).
 
+### Milestone 3 — FEITO (2026-07-22)
+- **`orders`/`fills` separados** (antes colapsados numa tabela em milestone 2). `orders` =
+  intenção (client_order_id, strategy_name, symbol, side, qty, status, effective_ts). `fills` =
+  execução (fill_id, client_order_id FK, symbol, side, qty, price, fee, filled_ts). Razão:
+  `LiveBroker` futuro pode ter fills parciais (uma ordem, vários fills) — conflar 1:1 agora só
+  para desfazer mais tarde, exatamente quando a correção mais importa (ordens reais).
+  `strategy_name` passou a coluna própria em `orders` (antes só entrava no hash do
+  `client_order_id`, nunca persistido).
+- **A garantia de atomicidade do milestone 2 sobrevive à divisão**: uma CTE com escrita
+  (`WITH new_order AS (INSERT ... RETURNING ...) INSERT INTO fills SELECT ... FROM new_order`)
+  mantém tudo numa única instrução/round-trip. Se `orders` bate no conflito, `new_order` fica
+  vazio, o INSERT em `fills` não escreve nada — o mesmo "sem falha nunca deixa uma ordem a
+  meio" do milestone 2, agora a atravessar duas tabelas.
+- **Migração versionada e reproduzível**: `bot/persistence/migrations/0001_...sql` +
+  `bot/persistence/migrate.py` (runner mínimo, tabela `schema_migrations`, idempotente —
+  correr duas vezes é no-op) + `scripts/migrate.py`. Não é um DROP/CREATE manual: é um passo
+  deliberado e commitado. Corrido contra o container real, aplicado, reconfirmado idempotente.
+- **Sem tabela `positions`.** `position(symbol)` é sempre o fold de `fills`
+  (`bot/persistence/ledger.py::position_from_ledger`/`all_positions`) — nunca um contador
+  guardado. O cache em memória do `PaperBroker` mantém-se (ganho real de performance), mas só é
+  legítimo porque: (a) é reconstruído do Postgres em cada instanciação, (b) só é atualizado
+  imediatamente a seguir a uma escrita durável bem-sucedida, com os mesmos valores. Reforçado
+  por teste (`test_position_always_equals_fold_of_fills`), não só por convenção.
+- **Reconciliação**: `bot/persistence/reconciliation.py`. `ExternalPositionSource` Protocol;
+  `LedgerPositionSource` (agora) faz um fold independente e fresco de `fills`, sem tocar no
+  cache do broker — apanha exatamente a classe de bug "cache divergiu do ledger". Seam para
+  `VenuePositionSource` (futuro `LiveBroker`, via ccxt) fica explícito no docstring, incluindo a
+  nota de que spot crypto tem saldos de carteira, não um campo "posição" como futuros — tradução
+  a resolver nessa altura, não agora. `reconcile()` escreve sempre uma linha em
+  `reconciliation_checks` (divergente ou não) e devolve `list[Divergence]` estruturado — hook de
+  alerta pronto, sem mecanismo de entrega (isso é observability, milestone 5/7). Decisão de
+  parar (kill-switch) fica para o milestone 4 — reconciliação só deteta e regista.
+- **Apenas convenção, não reforçado pela BD**: append-only é revisto por review, não por
+  `REVOKE UPDATE, DELETE`. Dívida técnica registada aqui deliberadamente — falta um role de
+  aplicação não-superuser, que não existe ainda (tudo corre como `postgres`). Sem teste
+  grep-based a fingir que isto está garantido (foi avaliado e rejeitado: falsos positivos em
+  colunas tipo `updated_at`/comentários, falsos negativos em SQL construído dinamicamente —
+  teatro de garantia, pior que admitir que é só convenção).
+- **`bot/persistence/`**: `db.py` (ligação), `migrate.py` (runner), `migrations/` (SQL
+  versionado), `ledger.py` (`record_fill`, `existing_fill`, `position_from_ledger`,
+  `all_positions`, `fills_for`), `reconciliation.py`. `bot/execution/db.py` do milestone 2
+  removido — schema e SQL de persistência vivem só em `bot/persistence/` agora;
+  `PaperBroker` calcula o fill (específico do paper), a persistência trata do resto.
+- **27/27 testes a passar**, incluindo os 3 pedidos especificamente: CTE atómica orders+fills
+  com o caminho de conflito a não escrever nada em nenhuma tabela
+  (`test_record_fill_conflict_inserts_nothing_in_either_table`), posição sempre igual ao fold de
+  `fills` (`test_position_always_equals_fold_of_fills`), e reconciliação a detetar uma
+  divergência cache-vs-ledger injetada deliberadamente
+  (`test_reconciliation_detects_injected_cache_vs_ledger_divergence`). Teste de concorrência do
+  milestone 2 recorrido 10x contra o novo schema — estável.
+- Strategy e o motor de backtest continuam sem importar `bot.persistence` nem `bot.execution` —
+  inalterado desde o milestone 1.
+- **Não construído (por desenho, não esquecimento):** dashboard, alerta com entrega real,
+  resposta a divergência além de log/registo (kill-switch é milestone 4), reconciliação
+  agendada/contínua (precisa do loop de orquestração, milestone 5).
+
 ## TODO imediato
-- [ ] Milestone 3: persistência Postgres completa (ledger/posições/ordens) + reconciliação —
-      migrar `orders` da tabela mínima atual para o schema completo (aguarda go-ahead do dono).
+- [ ] Milestone 4: risk layer (position sizing, limites, kill-switch) — usa `reconcile()` como
+      um dos possíveis gatilhos de halt (aguarda go-ahead do dono).
+- [ ] (Dívida técnica) `REVOKE UPDATE, DELETE ... FROM app_role` quando existir um role de
+      aplicação não-superuser — ver nota no milestone 3.
 - [ ] (Futuro, pré-requisito do gate) Split out-of-sample / walk-forward no backtester.
 - [ ] (Futuro) Avaliar Kraken (MiCA) como venue de dados/execução em alternativa à Binance.

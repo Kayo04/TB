@@ -45,7 +45,7 @@ reconciliação** — nunca com o saldo.
 - [x] **0** — Backtester honesto (sem look-ahead, com custos). Ver `bot/backtest/engine.py`.
 - [x] **1** — Interface `Strategy` + camada de dados ao vivo. Ver `bot/strategy/`, `bot/data/`.
 - [x] **2** — Execução em paper com idempotência. Ver `bot/execution/`.
-- [ ] **3** — Persistência Postgres (ledger/posições/ordens) + reconciliação.
+- [x] **3** — Persistência Postgres (ledger/posições/ordens) + reconciliação. Ver `bot/persistence/`.
 - [ ] **4** — Risk layer + kill-switch.
 - [ ] **5** — Loop autónomo 24/7 + observabilidade.
 - [ ] **6** — Deploy VPS; correr semanas em paper. Sucesso = uptime + reconciliação, não P&L.

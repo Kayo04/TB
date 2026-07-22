@@ -14,14 +14,15 @@ import psycopg
 import pytest
 
 from bot.execution.base import Order
-from bot.execution.db import get_connection
 from bot.execution.paper_broker import PaperBroker
+from bot.persistence.db import get_connection
 
 
-def _make_order(client_order_id="order-1", symbol="BTC/USDT", side="buy", qty=1.0,
-                 effective_ts="2024-01-01T00:00:00Z", reference_price=30000.0) -> Order:
+def _make_order(client_order_id="order-1", strategy_name="ma_crossover", symbol="BTC/USDT",
+                 side="buy", qty=1.0, effective_ts="2024-01-01T00:00:00Z", reference_price=30000.0) -> Order:
     return Order(
         client_order_id=client_order_id,
+        strategy_name=strategy_name,
         symbol=symbol,
         side=side,
         qty=qty,
@@ -30,9 +31,15 @@ def _make_order(client_order_id="order-1", symbol="BTC/USDT", side="buy", qty=1.
     )
 
 
-def _count_rows(conn, client_order_id) -> int:
+def _order_count(conn, client_order_id) -> int:
     return conn.execute(
         "SELECT COUNT(*) AS c FROM orders WHERE client_order_id = %s", (client_order_id,)
+    ).fetchone()["c"]
+
+
+def _fill_count(conn, client_order_id) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) AS c FROM fills WHERE client_order_id = %s", (client_order_id,)
     ).fetchone()["c"]
 
 
@@ -53,36 +60,49 @@ def test_clean_replay_returns_same_fill_no_duplicate(db_conn):
     assert fill2.status == "duplicate_ignored"
     assert fill2.filled_price == fill1.filled_price
     assert fill2.filled_ts == fill1.filled_ts
-    assert _count_rows(db_conn, order.client_order_id) == 1
+    assert _order_count(db_conn, order.client_order_id) == 1
+    assert _fill_count(db_conn, order.client_order_id) == 1
     assert restarted_broker.position(order.symbol) == order.qty  # not double counted
 
 
 # --------------------------------------------------------------------------- #
-# 2. Aborted attempt (crash before commit) leaves no trace
+# 2. Aborted attempt (crash before commit) leaves no trace in EITHER table
 # --------------------------------------------------------------------------- #
 
 def test_aborted_insert_leaves_no_trace_then_real_attempt_succeeds(db_conn):
     order = _make_order(client_order_id="order-aborted")
 
-    # simulate a crash before commit: separate connection, insert, then roll back
+    # simulate a crash mid-write: separate connection, run the same shape of
+    # write record_fill() would (order + fill together), then roll back --
+    # as if the process died before the transaction committed.
     conn2 = psycopg.connect(os.environ["DATABASE_URL"])  # autocommit False by default
     conn2.execute(
         """
-        INSERT INTO orders (client_order_id, symbol, side, qty, status, filled_price, fee, effective_ts, filled_ts)
-        VALUES (%s, %s, %s, %s, 'filled', %s, %s, %s, %s)
+        INSERT INTO orders (client_order_id, strategy_name, symbol, side, qty, status, effective_ts)
+        VALUES (%s, %s, %s, %s, %s, 'filled', %s)
+        """,
+        (order.client_order_id, order.strategy_name, order.symbol, order.side, order.qty,
+         order.effective_ts.to_pydatetime()),
+    )
+    conn2.execute(
+        """
+        INSERT INTO fills (client_order_id, symbol, side, qty, price, fee, filled_ts)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         """,
         (order.client_order_id, order.symbol, order.side, order.qty, 30000.0, 3.0,
-         order.effective_ts.to_pydatetime(), order.effective_ts.to_pydatetime()),
+         order.effective_ts.to_pydatetime()),
     )
     conn2.rollback()
     conn2.close()
 
-    assert _count_rows(db_conn, order.client_order_id) == 0, "rolled-back attempt must leave no row"
+    assert _order_count(db_conn, order.client_order_id) == 0, "rolled-back attempt must leave no order row"
+    assert _fill_count(db_conn, order.client_order_id) == 0, "rolled-back attempt must leave no fill row"
 
     broker = PaperBroker(db_conn)
     fill = broker.submit_order(order)  # the "real" attempt, after the simulated crash
     assert fill.status == "filled"
-    assert _count_rows(db_conn, order.client_order_id) == 1
+    assert _order_count(db_conn, order.client_order_id) == 1
+    assert _fill_count(db_conn, order.client_order_id) == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -103,7 +123,8 @@ def test_crash_after_commit_before_caller_sees_result(db_conn):
     assert second_fill.filled_price == first_fill.filled_price
     assert second_fill.fee == first_fill.fee
     assert second_fill.filled_ts == first_fill.filled_ts
-    assert _count_rows(db_conn, order.client_order_id) == 1
+    assert _order_count(db_conn, order.client_order_id) == 1
+    assert _fill_count(db_conn, order.client_order_id) == 1
     assert broker.position(order.symbol) == order.qty  # only counted once despite two calls
 
 
@@ -140,7 +161,8 @@ def test_concurrent_duplicate_submission_only_one_fill(db_conn):
     statuses = [r.status for r in results]
     assert statuses.count("filled") == 1, "exactly one concurrent submission should win the insert"
     assert statuses.count("duplicate_ignored") == len(threads) - 1
-    assert _count_rows(db_conn, order.client_order_id) == 1
+    assert _order_count(db_conn, order.client_order_id) == 1
+    assert _fill_count(db_conn, order.client_order_id) == 1
 
 
 # --------------------------------------------------------------------------- #
