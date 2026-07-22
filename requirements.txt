@@ -1,0 +1,4 @@
+ccxt
+pandas
+numpy
+# adicionar mais tarde (milestone 3): SQLAlchemy, psycopg[binary]
