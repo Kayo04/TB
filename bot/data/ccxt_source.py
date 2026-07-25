@@ -117,16 +117,56 @@ class CcxtDataSource:
 
     async def _stream_ws(self, symbol: str, timeframe: str) -> AsyncIterator[Bar]:
         ex = getattr(ccxtpro, self.exchange_id)()
+        # ccxt.pro defaults newUpdates=True: watch_ohlcv() then returns only
+        # the candle(s) that changed since the *previous* call -- almost
+        # always just the single still-forming candle on every websocket
+        # tick. That made `len(candles) < 2` true on every iteration,
+        # forever, so a bar close was never detected (confirmed against the
+        # installed ccxt==4.5.67 source -- ArrayCache.getLimit /
+        # watch_ohlcv_for_symbols -- see PROGRESS.md). Disabling newUpdates
+        # and passing an explicit limit restores the stable
+        # [..., closed, forming] window this method has always assumed.
+        ex.newUpdates = False
         last_emitted_ts: Optional[int] = None
         first_call = True
+        last_heartbeat = time.monotonic()
         try:
             while True:
                 if first_call:
                     logger.info("_stream_ws: awaiting first watch_ohlcv(%s, %s)", symbol, timeframe)
-                candles = await ex.watch_ohlcv(symbol, timeframe)
+                candles = await ex.watch_ohlcv(symbol, timeframe, limit=3)
+                if logger.isEnabledFor(logging.DEBUG):
+                    # Full raw window every resolution: exactly what the
+                    # library handed back, timestamp by timestamp, with each
+                    # one labelled closed/forming (only the last element is
+                    # ever "forming" by this method's own convention -- this
+                    # log is what lets us confirm or refute that convention
+                    # against live data, not just assume it).
+                    logger.debug(
+                        "_stream_ws: watch_ohlcv(%s, %s) raw candles=%s",
+                        symbol, timeframe,
+                        [
+                            {
+                                "ts": row[0],
+                                "ts_iso": pd.Timestamp(row[0], unit="ms", tz="UTC").isoformat(),
+                                "close": row[4],
+                                "position": "forming" if i == len(candles) - 1 else "closed",
+                            }
+                            for i, row in enumerate(candles)
+                        ],
+                    )
                 if first_call:
                     logger.info("_stream_ws: first watch_ohlcv() resolved with %d candles", len(candles))
                     first_call = False
+
+                now = time.monotonic()
+                if now - last_heartbeat >= 60:
+                    logger.info(
+                        "_stream_ws: heartbeat -- alive, watching %s %s, last candle ts=%s, last emitted bar ts=%s",
+                        symbol, timeframe, candles[-1][0] if candles else None, last_emitted_ts,
+                    )
+                    last_heartbeat = now
+
                 if len(candles) < 2:
                     continue
                 closed = candles[:-1]  # last element is the still-forming bar
@@ -135,8 +175,10 @@ class CcxtDataSource:
                     if last_emitted_ts is not None and ts_ms <= last_emitted_ts:
                         continue
                     last_emitted_ts = ts_ms
+                    bar_ts = pd.Timestamp(ts_ms, unit="ms", tz="UTC")
+                    logger.info("BAR CLOSED ts=%s -> yielding", bar_ts)
                     yield Bar(
-                        ts=pd.Timestamp(ts_ms, unit="ms", tz="UTC"),
+                        ts=bar_ts,
                         open=row[1], high=row[2], low=row[3], close=row[4], volume=row[5],
                     )
         finally:

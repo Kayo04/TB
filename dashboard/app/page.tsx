@@ -5,6 +5,7 @@ import PositionTable from "@/components/PositionTable";
 import ReconciliationTable from "@/components/ReconciliationTable";
 import RiskEventsTable from "@/components/RiskEventsTable";
 import CycleHealthPanel from "@/components/CycleHealthPanel";
+import HeartbeatStatus from "@/components/HeartbeatStatus";
 
 // This page must reflect live database state on every request -- never
 // statically cached or ISR'd.
@@ -27,6 +28,8 @@ export default function DashboardPage() {
 
       <section>
         <h2>Estado ao vivo</h2>
+        <h3>Heartbeat</h3>
+        <HeartbeatStatus />
         <h3>Posições</h3>
         <PositionTable />
         <p style={{ fontSize: "0.85em", color: "#666" }}>

@@ -44,6 +44,7 @@ cancellable at all.
 from __future__ import annotations
 import asyncio
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -61,6 +62,7 @@ from bot.risk.base import RiskLimits
 from bot.risk.gate import MarkPriceSource
 from bot.strategy.base import Strategy
 from bot.orchestration.alerts import AlertSink
+from bot.orchestration.heartbeat import record_heartbeat
 from bot.orchestration.run_log import record_cycle
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,10 @@ class RunnerConfig:
     stream_wait_timeout_bars: float = 3.0
     stream_wait_timeout_margin_seconds: float = 300.0
     stream_wait_timeout_seconds: Optional[float] = None
+    # Durable liveness signal, independent of bar cadence -- see
+    # bot/orchestration/heartbeat.py. Runs concurrently with the bar-waiting
+    # loop for the whole lifetime of run_forever().
+    heartbeat_interval_seconds: float = 60.0
 
 
 class LiveRunner:
@@ -113,6 +119,13 @@ class LiveRunner:
         self._timeframe_delta = pd.Timedelta(timeframe)
         self._buffer_df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         self._buffer_df.index.name = "ts"
+        # _run_cycle_sync runs in a worker thread (via to_thread) while the
+        # heartbeat loop below writes from a *different* thread on its own
+        # ~60s cadence -- psycopg.Connection is not safe for concurrent use
+        # from two threads at once, so both paths serialize through this
+        # lock before touching self.conn.
+        self._conn_lock = threading.Lock()
+        self._heartbeat_component = f"live_runner:{symbol}:{timeframe}"
         if self.config.stream_wait_timeout_seconds is not None:
             self._stream_wait_timeout_seconds = self.config.stream_wait_timeout_seconds
         else:
@@ -145,6 +158,35 @@ class LiveRunner:
     # ------------------------------------------------------------------ #
 
     async def run_forever(self) -> None:
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        try:
+            await self._run_forever_body()
+        finally:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+    def _write_heartbeat_sync(self, detail: str) -> None:
+        with self._conn_lock:
+            record_heartbeat(self.conn, component=self._heartbeat_component, detail=detail)
+
+    async def _heartbeat_loop(self) -> None:
+        """Writes a durable heartbeat row on a fixed ~60s cadence, independent
+        of bar arrival -- so the dashboard can tell "healthily waiting for the
+        next bar" apart from "silently stuck" without waiting up to an hour."""
+        while True:
+            try:
+                await asyncio.to_thread(self._write_heartbeat_sync, "running")
+                logger.info(
+                    "heartbeat: live_runner alive (symbol=%s timeframe=%s)", self.symbol, self.timeframe
+                )
+            except Exception as exc:
+                logger.error("heartbeat write failed: %r", exc)
+            await asyncio.sleep(self.config.heartbeat_interval_seconds)
+
+    async def _run_forever_body(self) -> None:
         delay = self.config.stream_reconnect_base_delay
         while True:
             stream_iter = self.data_source.stream(self.symbol, self.timeframe).__aiter__()
@@ -235,6 +277,10 @@ class LiveRunner:
             self._buffer_df = self._buffer_df.iloc[-warmup:]
 
     def _run_cycle_sync(self, bar: Bar) -> None:
+        with self._conn_lock:
+            self._run_cycle_locked(bar)
+
+    def _run_cycle_locked(self, bar: Bar) -> None:
         start = time.monotonic()
         was_halted = kill_switch.is_halted(self.conn)
         signal: Optional[int] = None

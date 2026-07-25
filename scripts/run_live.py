@@ -11,6 +11,7 @@ as scripts/run_backtest.py, not a claim of edge.
 from __future__ import annotations
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -30,7 +31,12 @@ from bot.risk.gate import RiskGate, StaticMarkPriceSource
 from bot.orchestration.alerts import LogAlertSink
 from bot.orchestration.runner import LiveRunner
 
+_LOG_LEVEL = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+# Root stays at INFO regardless -- ccxt/urllib3/websockets are extremely
+# chatty at DEBUG (full market-listing dumps per call) and would drown out
+# anything of ours. LOG_LEVEL=DEBUG only elevates our own "bot.*" loggers.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.getLogger("bot").setLevel(_LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 SYMBOL = "BTC/USDT"

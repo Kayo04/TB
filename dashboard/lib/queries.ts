@@ -120,6 +120,26 @@ export async function getReconciliationChecks(limit = 50): Promise<Reconciliatio
   return rows;
 }
 
+export type HeartbeatRow = {
+  component: string;
+  detail: string | null;
+  lastSeenAt: string;
+};
+
+// Distinct from getCycleHealth() below: run_log only gains a row when a bar
+// closes (up to once per timeframe -- once an hour for 1h bars). heartbeat
+// is written by LiveRunner on a fixed ~60s cadence regardless of bar
+// activity, so "last activity" here can catch a wedged process within
+// roughly a minute instead of only after an hour-long silence.
+export async function getHeartbeat(): Promise<HeartbeatRow | null> {
+  const { rows } = await pool.query<{ component: string; detail: string | null; last_seen_at: string }>(
+    "SELECT component, detail, last_seen_at FROM heartbeat ORDER BY last_seen_at DESC LIMIT 1"
+  );
+  const row = rows[0];
+  if (!row) return null;
+  return { component: row.component, detail: row.detail, lastSeenAt: row.last_seen_at };
+}
+
 export type CycleHealth = {
   lastCycleAt: string | null;
   minutesSinceLastCycle: number | null;
