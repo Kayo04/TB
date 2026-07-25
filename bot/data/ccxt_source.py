@@ -15,6 +15,7 @@ interface — callers can't tell which path is active.
 
 from __future__ import annotations
 import asyncio
+import logging
 import time
 from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
@@ -29,6 +30,8 @@ try:
     _HAS_CCXT_PRO = True
 except ImportError:
     _HAS_CCXT_PRO = False
+
+logger = logging.getLogger(__name__)
 
 
 def _to_utc_ms(dt: datetime) -> int:
@@ -103,7 +106,9 @@ class CcxtDataSource:
         return supported
 
     async def stream(self, symbol: str, timeframe: str) -> AsyncIterator[Bar]:
-        if self._supports_watch_ohlcv():
+        use_ws = self._supports_watch_ohlcv()
+        logger.info("stream(%s, %s): using %s", symbol, timeframe, "websocket" if use_ws else "REST polling")
+        if use_ws:
             async for bar in self._stream_ws(symbol, timeframe):
                 yield bar
         else:
@@ -113,9 +118,15 @@ class CcxtDataSource:
     async def _stream_ws(self, symbol: str, timeframe: str) -> AsyncIterator[Bar]:
         ex = getattr(ccxtpro, self.exchange_id)()
         last_emitted_ts: Optional[int] = None
+        first_call = True
         try:
             while True:
+                if first_call:
+                    logger.info("_stream_ws: awaiting first watch_ohlcv(%s, %s)", symbol, timeframe)
                 candles = await ex.watch_ohlcv(symbol, timeframe)
+                if first_call:
+                    logger.info("_stream_ws: first watch_ohlcv() resolved with %d candles", len(candles))
+                    first_call = False
                 if len(candles) < 2:
                     continue
                 closed = candles[:-1]  # last element is the still-forming bar
@@ -134,6 +145,7 @@ class CcxtDataSource:
     async def _stream_poll(self, symbol: str, timeframe: str) -> AsyncIterator[Bar]:
         tf_seconds = self._sync_exchange.parse_timeframe(timeframe)
         last_emitted_ts: Optional[int] = None
+        logger.info("_stream_poll: polling %s %s every %.0fs", symbol, timeframe, min(tf_seconds / 4, 30))
         while True:
             batch = self._sync_exchange.fetch_ohlcv(symbol, timeframe, limit=2)
             if len(batch) >= 2:

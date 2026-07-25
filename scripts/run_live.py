@@ -31,14 +31,17 @@ from bot.orchestration.alerts import LogAlertSink
 from bot.orchestration.runner import LiveRunner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 SYMBOL = "BTC/USDT"
 TIMEFRAME = "1h"
 EXCHANGE = "binance"
 
 if __name__ == "__main__":
+    logger.info("run_live starting: symbol=%s timeframe=%s exchange=%s", SYMBOL, TIMEFRAME, EXCHANGE)
     conn = get_connection(autocommit=True)
     run_migrations(conn)
+    logger.info("migrations applied, constructing runner")
 
     strategy = MACrossoverStrategy(fast=20, slow=50)
     data_source = CcxtDataSource(exchange=EXCHANGE)

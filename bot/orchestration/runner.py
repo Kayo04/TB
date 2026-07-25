@@ -71,6 +71,17 @@ class RunnerConfig:
     cycle_timeout_seconds: float = 30.0
     stream_reconnect_base_delay: float = 5.0
     stream_reconnect_max_delay: float = 300.0
+    # How long to wait for the *next* bar before treating the stream itself as
+    # dead. Deliberately NOT a short constant like cycle_timeout_seconds: bars
+    # are only expected once per timeframe (e.g. once an hour), so the default
+    # scales off the runner's actual timeframe -- stream_wait_timeout_bars
+    # multiples of one bar interval, plus a flat margin to absorb ordinary
+    # network/exchange jitter. See LiveRunner.__init__ for the computation.
+    # stream_wait_timeout_seconds overrides that computation outright when
+    # set (e.g. in tests, where a real timeframe-scaled wait is untestable).
+    stream_wait_timeout_bars: float = 3.0
+    stream_wait_timeout_margin_seconds: float = 300.0
+    stream_wait_timeout_seconds: Optional[float] = None
 
 
 class LiveRunner:
@@ -102,6 +113,13 @@ class LiveRunner:
         self._timeframe_delta = pd.Timedelta(timeframe)
         self._buffer_df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         self._buffer_df.index.name = "ts"
+        if self.config.stream_wait_timeout_seconds is not None:
+            self._stream_wait_timeout_seconds = self.config.stream_wait_timeout_seconds
+        else:
+            self._stream_wait_timeout_seconds = (
+                self.config.stream_wait_timeout_bars * self._timeframe_delta.total_seconds()
+                + self.config.stream_wait_timeout_margin_seconds
+            )
 
     # ------------------------------------------------------------------ #
     # Startup
@@ -110,8 +128,17 @@ class LiveRunner:
     def seed_from_history(self) -> None:
         warmup = self.strategy.warmup_bars()
         since = datetime.now(timezone.utc) - warmup * self._timeframe_delta
+        logger.info(
+            "seed_from_history: fetching %s %s history since %s (warmup=%d bars)",
+            self.symbol, self.timeframe, since, warmup,
+        )
         df = self.data_source.fetch_history(self.symbol, self.timeframe, since=since)
         self._buffer_df = df.iloc[-warmup:] if len(df) > warmup else df
+        logger.info(
+            "seed_from_history: seeded %d bars, most recent=%s",
+            len(self._buffer_df),
+            self._buffer_df.index[-1] if len(self._buffer_df) else None,
+        )
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -120,8 +147,27 @@ class LiveRunner:
     async def run_forever(self) -> None:
         delay = self.config.stream_reconnect_base_delay
         while True:
+            stream_iter = self.data_source.stream(self.symbol, self.timeframe).__aiter__()
             try:
-                async for bar in self.data_source.stream(self.symbol, self.timeframe):
+                logger.info(
+                    "run_forever: opening %s stream for %s %s (stream-wait timeout=%.0fs)",
+                    type(self.data_source).__name__, self.symbol, self.timeframe,
+                    self._stream_wait_timeout_seconds,
+                )
+                while True:
+                    # Wrapping the wait for the *next* bar (not just processing
+                    # one already received) is what actually closes the gap: a
+                    # stream that silently never yields -- e.g. a websocket
+                    # handshake or watch_ohlcv() call that hangs with no
+                    # exception -- used to block here forever. cycle_timeout_seconds
+                    # above only ever covered work done *after* a bar arrived,
+                    # so it could never catch this. A TimeoutError here is just
+                    # another stream failure -- it's left to propagate into the
+                    # same `except Exception` reconnect/backoff below rather
+                    # than handled specially.
+                    bar = await asyncio.wait_for(
+                        stream_iter.__anext__(), timeout=self._stream_wait_timeout_seconds
+                    )
                     try:
                         await asyncio.wait_for(
                             self.run_cycle(bar), timeout=self.config.cycle_timeout_seconds
@@ -160,6 +206,14 @@ class LiveRunner:
                 logger.error("stream failed: %r -- reconnecting in %.0fs", exc, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, self.config.stream_reconnect_max_delay)
+            finally:
+                # Explicitly unwind the async generator so its own cleanup
+                # (e.g. CcxtDataSource._stream_ws's `await ex.close()`) runs
+                # promptly on every reconnect, not whenever the GC gets to it.
+                try:
+                    await stream_iter.aclose()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------ #
     # One cycle

@@ -80,6 +80,28 @@ class FakeDataSource:
             yield bar
 
 
+class HangingDataSource:
+    """stream() never yields and never raises on its first open -- simulating a
+    websocket connection that silently dies (no exception, no data), exactly
+    what a naive await could block on forever. Every open after the first
+    behaves normally, so a test can prove reconnection actually recovers."""
+
+    def __init__(self, bars_after_hang: list[Bar]):
+        self._bars_after_hang = bars_after_hang
+        self.open_count = 0
+
+    def fetch_history(self, symbol, timeframe, since, until=None):
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    async def stream(self, symbol, timeframe):
+        self.open_count += 1
+        if self.open_count == 1:
+            await asyncio.sleep(3600)  # never resolves within any real test window
+            return
+        for bar in self._bars_after_hang:
+            yield bar
+
+
 def _bar(ts: str, close: float = 100.0) -> Bar:
     return Bar(ts=pd.Timestamp(ts), open=close, high=close + 1, low=close - 1, close=close, volume=1.0)
 
@@ -213,3 +235,38 @@ def test_hung_cycle_hits_timeout_and_loop_moves_on(db_conn):
     assert bar2.ts in first_decision, "the loop must move on to bar2 instead of getting stuck on bar1's timeout"
     assert first_decision[bar1.ts] == "cycle_failed"
     assert first_decision[bar2.ts] == "cycle_failed"
+
+
+# --------------------------------------------------------------------------- #
+# A stream that silently never yields (no exception, no data) times out and
+# reconnects -- instead of hanging forever, which is what happened for real
+# for 2+ hours before this fix (a hung watch_ohlcv() call with no timeout
+# around waiting for the next bar, only around processing one already received).
+# --------------------------------------------------------------------------- #
+
+def test_stream_hang_times_out_and_triggers_reconnect(db_conn):
+    bar = _bar("2024-01-01T00:00:00Z")
+    data_source = HangingDataSource(bars_after_hang=[bar])
+    config = RunnerConfig(
+        cycle_timeout_seconds=0.2,
+        stream_reconnect_base_delay=0.05,
+        stream_reconnect_max_delay=0.1,
+        stream_wait_timeout_seconds=0.2,  # override: a real timeframe-scaled wait is untestable
+    )
+    strategy = ScriptedStrategy(warmup=1, signals={bar.ts: 0})
+    runner, _broker = _make_runner(strategy, db_conn, data_source=data_source, config=config)
+
+    try:
+        asyncio.run(asyncio.wait_for(runner.run_forever(), timeout=1.0))
+    except asyncio.TimeoutError:
+        pass  # run_forever() never returns on its own; we just bounded the test
+
+    assert data_source.open_count >= 2, (
+        "a stream that never yields must trigger a reconnect (a second stream() open) "
+        "instead of blocking run_forever() forever on the first"
+    )
+    row = db_conn.execute(
+        "SELECT * FROM run_log WHERE bar_ts = %s", (bar.ts.to_pydatetime(),)
+    ).fetchone()
+    assert row is not None, "after reconnecting, the loop must actually resume processing real bars"
+    assert row["decision"] == "no_transition"
