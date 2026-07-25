@@ -471,6 +471,52 @@ Novo `dashboard/`, Next.js + TypeScript, serviço irmão no `docker-compose.yml`
   `trading-bot-postgres-test`, container separado, volume próprio (`trading-bot-pgdata-test`), só
   para testes locais — não interfere com a stack "real" gerida pelo Compose.
 
+### Bug real: live nunca detetava fecho de barra (2026-07-25) -- corrigido
+Depois de meses só em backtest/paper local, a primeira corrida live suficientemente longa para
+um bar fechar (1h) revelou que `LiveRunner` nunca disparava um ciclo -- `run_log` ficava vazio
+indefinidamente, apesar do processo estar vivo e sem erros nos logs.
+- **Causa raiz**: `ccxt.pro`'s `watch_ohlcv()` tem `newUpdates=True` por default -- devolve só a
+  candle que mudou desde a chamada anterior (normalmente 1, a candle em formação a cada tick do
+  websocket), independentemente de qualquer `limit` pedido. `_stream_ws` (milestone 1) assumia
+  sempre receber `[..., fechada, em_formação]`; com a truncagem, `len(candles) < 2` era verdade
+  em todas as iterações, para sempre -- `continue` infinito, nunca um fecho de barra detetado.
+  Confirmado lendo o código-fonte do `ccxt==4.5.67` instalado (`ArrayCache.getLimit`,
+  `watch_ohlcv_for_symbols`), não só por inferência.
+- **Fix**: `ex.newUpdates = False` + `limit=3` explícito em `watch_ohlcv()`, restaurando a janela
+  estável que o método sempre assumiu. **Verificado ao vivo através de uma fronteira real de
+  hora UTC**: `watch_ohlcv` devolveu as duas candles (17:00 fechada + 18:00 em formação),
+  `BAR CLOSED -> yielding` disparou, e um ciclo real escreveu em `run_log`
+  (`bar=17:00 signal=0 decision=no_transition duration_ms=306`) -- não só um teste a passar.
+- **Falso alarme pelo caminho**: a primeira leitura da telemetria ao vivo (heartbeat sempre a
+  mostrar a mesma candle, `last emitted bar ts=None`) pareceu confirmar que o fix não tinha
+  resolvido nada -- mas isso era o estado *esperado* antes da primeira fronteira de hora real
+  desde o restart (a cache só acumula candles desde que esta ligação websocket abriu). O teste de
+  regressão inicial (fake exchange a reproduzir a truncagem) passou correndo mas não bastava
+  sozinho como prova -- só a observação ao vivo através de uma fronteira real confirmou o fix.
+  Lição: para bugs de timing/estado-ao-vivo, teste unitário + prova ao vivo, não um ou outro.
+- **Teste de regressão** (`tests/test_data.py::test_watch_ohlcv_newUpdates_truncation_no_longer_stalls_bar_close`):
+  fake `ccxt.pro` a reproduzir a semântica real de truncagem (overwrite em-lugar enquanto o
+  timestamp não muda, append quando muda; só 1 candle devolvida se `newUpdates` truthy). Falha de
+  novo (timeout) se o fix for revertido.
+- **Visibilidade adicionada** (pedido explícito do dono depois do bug, não só o fix): log DEBUG
+  da janela raw de candles a cada resolução (todos os timestamps + fechada/em-formação), heartbeat
+  INFO a cada ~60s dentro de `_stream_ws`, linha `BAR CLOSED ts=X -> yielding` explícita.
+  `LOG_LEVEL` (env var, default INFO) liga o DEBUG sem mudar código -- só para os loggers `bot.*`,
+  não a raiz (ccxt/urllib3 são extremamente verbosos em DEBUG).
+- **Heartbeat durável** (tabela `heartbeat`, migration `0005`): distinto de `run_log` -- esse só
+  ganha linha nova quando um bar fecha (até 1x/timeframe, 1x/hora aqui); heartbeat é escrito por
+  `LiveRunner` a cada ~60s independentemente da atividade de bars, via task assíncrona em
+  background. Serializado com `_run_cycle_sync` por um `threading.Lock` -- `psycopg.Connection`
+  não é seguro para uso concorrente por duas threads, e a task de heartbeat corre em thread
+  diferente da do ciclo (`asyncio.to_thread` em ambos). Visível no dashboard: painel "Heartbeat"
+  em "Estado ao vivo", "última atividade: há Xs", distinto do "último ciclo" do
+  `CycleHealthPanel` -- objetivo explícito do dono era distinguir "à espera, saudável" de
+  "preso, silenciosamente" sem esperar até 1h por um bar.
+- **45/45 testes a passar** (43 anteriores + 1 novo de regressão + `heartbeat` acrescentado ao
+  `TRUNCATE` do fixture `db_conn`). `.env` local precisou de `DATABASE_URL` reposto (tinha sido
+  perdido quando o milestone 6/dashboard reescreveu o ficheiro só com os secrets do
+  docker-compose) -- documentado inline no próprio `.env`, não escondido.
+
 ## TODO imediato
 - [ ] (Futuro) Upgrade da dashboard para Next.js 16 -- limpa os CVEs conhecidos da série 14.x;
       adiado porque é uma mudança maior do que o âmbito aprovado deste build, ver nota acima.
