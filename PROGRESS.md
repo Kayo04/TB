@@ -400,11 +400,81 @@ servidor (secção "Comandos... correstes no servidor" do `DEPLOY.md`) ficam por
   exec`), redeploy, recuperação total do zero, e a lista explícita do que fica fora de âmbito.
 - **Nenhuma mudança a lógica do bot** — só empacotamento. `bot/`, `scripts/run_live.py` intocados.
 
+### Nota (2026-07-22): VPS pago descartado, stack corre localmente
+Dono decidiu não avançar com o VPS Hetzner pago. `DEPLOY.md` mantém-se válido para se/quando essa
+decisão for revista (nada nele depende de já ter sido feito) — mas o cenário real agora é a stack
+`docker-compose` completa a correr na própria máquina do dono, sem tunnel SSH nenhum. Documentação
+do dashboard (abaixo) escrita para este cenário, não o de servidor remoto.
+
+### Milestone — Dashboard só-leitura (2026-07-22) — FEITO
+Novo `dashboard/`, Next.js + TypeScript, serviço irmão no `docker-compose.yml`. Zero mudanças a
+`bot/` além da migration (schema, não lógica).
+
+- **Enforcement real de só-leitura, não convenção.** Migration `0004_dashboard_readonly_role.sql`
+  cria o role `dashboard_ro` que **nunca** recebe grants de escrita — sem `REVOKE` necessário,
+  diferente do role do próprio bot (que continua superuser, dívida técnica adiada desde o
+  milestone 3). `GRANT SELECT ON ALL TABLES` + `ALTER DEFAULT PRIVILEGES` cobre também tabelas
+  futuras sem grant adicional. Sem password na migration (role com `LOGIN` sem password não
+  autentica) — password definida uma vez, em runtime, via `ALTER ROLE` (nunca commitada).
+  Provado por comportamento real (`tests/test_dashboard_role.py`, 5/5 a passar): `SELECT` funciona,
+  `INSERT`/`UPDATE`/`DELETE` rebentam com `InsufficientPrivilege`, e uma tabela nova criada depois
+  do role já existir continua legível sem grant extra (prova o `ALTER DEFAULT PRIVILEGES`). Mesmo
+  padrão que rejeitou o grep-test teatral do milestone 3 — isto testa Postgres a recusar de
+  verdade, não um padrão no código-fonte.
+- **Base de código completamente separada.** `dashboard/` é TypeScript próprio, `package.json`
+  próprio, não importa nada de `bot/`. Não há sequer um caminho de código possível até
+  `RiskGate.submit_order()` ou `kill_switch.clear_halt()` — não é "não ligámos", é "não existe
+  ligação para ligar".
+- **Uma página, três secções**, Server Components a ler Postgres diretamente (sem camada de API),
+  `export const dynamic = "force-dynamic"` para nunca cachear estado que tem de ser ao vivo,
+  `AutoRefresh` (client component, `router.refresh()` a cada ~20s). Componentes: `RunLogTable`,
+  `TradeBlotter`, `EquityCurveChart` (+ `EquityCurveClient` para o recharts, que precisa de
+  correr no cliente), `PositionTable`, `ReconciliationTable`, `RiskEventsTable`,
+  `CycleHealthPanel`.
+- **Curva de equity: `equity_snapshots` (mark-to-market), não uma repetição do backtest.** Decisão
+  do dono confirmando a tensão que apanhei na proposta: a fórmula do backtest precisa de preço em
+  cada barra, e não guardamos histórico de barras (o buffer do orchestrator é em memória, de
+  propósito) — replicar isso precisaria de uma tabela nova que nada escreve, deixando de ser
+  "só ler o que existe". `equity_snapshots` (já calculado pelo risk layer a cada ciclo desde o
+  milestone 4/5) é a resposta melhor e mais honesta a "quanto vale a conta ao longo do tempo",
+  a custo zero. UI é explícita sobre isto (`EquityCurveChart`'s legenda).
+- **`PaperModeBanner` + `HaltBanner` no layout raiz** — estruturalmente impossível renderizar
+  qualquer página sem o aviso "SIMULADO — PAPER TRADING" e sem o estado atual do kill-switch.
+  "Estado ao vivo" também inclui posição por símbolo (mesmo fold SQL que
+  `ledger.position_from_ledger`, reimplementado em SQL já que TS não importa Python) e um sinal de
+  liveness **explicitamente rotulado como inferido** (gap desde o último `run_log`, não uma prova
+  de que o processo está vivo — Postgres sozinho não consegue provar isso).
+- **Bug real apanhado durante o build**: `next build` falhava ao tentar pré-renderizar
+  estaticamente a página `/_not-found` do Next (que herda o layout raiz, logo o `HaltBanner` e a
+  sua query a Postgres) — em build-time não há `DATABASE_URL` real, e o build rebentava.
+  `page.tsx` já tinha `dynamic = "force-dynamic"`, mas isso só cobre essa rota; corrigido movendo
+  o mesmo export para `app/layout.tsx`, cobrindo todas as rotas que herdam o layout, incluída a
+  auto-gerada.
+- **Verificado de ponta a ponta, não só "os ficheiros existem"**: `npm install`, `tsc --noEmit`
+  limpo, `next build` limpo (depois do fix acima), servidor corrido localmente ligado ao role
+  `dashboard_ro` real, dados de exemplo inseridos diretamente via superuser (nunca através da
+  dashboard), confirmados a aparecer corretamente formatados na página servida por HTTP —
+  datas, números (locale do SO), símbolos, decisões. Prova a fatia vertical completa: escrita só
+  possível pelo bot/superuser, leitura só possível pela dashboard via role sem permissão de
+  escrever.
+- **Achado durante o build, não escondido**: `next@^14.2.0` resolveu para `14.2.35` (o último
+  patch da série 14.2.x), mas `npm audit` continua a assinalar CVEs conhecidos nessa série inteira
+  (DoS/XSS/cache-poisoning em apps self-hosted expostas a tráfego não confiável) — o fix sugerido
+  é Next 16, uma major version que não foi o que foi aprovado para este build. Decisão: manter
+  14.2.35 por agora — a dashboard está atrás de `127.0.0.1` só, single-user, sem tráfego não
+  confiável, o que reduz a exploitabilidade real da maioria destes CVEs a quase zero para este
+  deployment específico. Upgrade para Next 16 fica como item futuro explícito, não decidido aqui.
+- **43/43 testes Python a passar** (38 anteriores + 5 novos de `test_dashboard_role.py`).
+- Ambiente de teste local precisou de reconstrução: o container standalone `trading-bot-postgres`
+  (usado por pytest desde o milestone 2) já não existia — substituído pela stack `docker-compose`
+  (que corretamente não publica porta, por desenho do milestone 6). Recriado como
+  `trading-bot-postgres-test`, container separado, volume próprio (`trading-bot-pgdata-test`), só
+  para testes locais — não interfere com a stack "real" gerida pelo Compose.
+
 ## TODO imediato
-- [ ] Milestone 6 (continuação): dono corre o runbook (`DEPLOY.md`) no servidor real — criação,
-      hardening, deploy, smoke test, backups agendados. Confirmar de volta para marcar o roadmap
-      em `CLAUDE.md` como feito; até lá o checkbox fica por marcar porque "sobrevive semanas" não é
-      algo que eu consiga verificar a partir daqui.
+- [ ] (Futuro) Upgrade da dashboard para Next.js 16 -- limpa os CVEs conhecidos da série 14.x;
+      adiado porque é uma mudança maior do que o âmbito aprovado deste build, ver nota acima.
+- [ ] Se o VPS voltar à mesa: `DEPLOY.md` continua válido tal como está.
 - [ ] (Dívida técnica) Corrida de thread presa não-defendida em `LiveRunner` — ver nota no
       milestone 5. Resolver a sério só faz sentido com `LiveBroker`.
 - [ ] (Dívida técnica) `REVOKE UPDATE, DELETE ... FROM app_role` quando existir um role de

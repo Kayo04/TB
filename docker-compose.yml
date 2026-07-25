@@ -29,5 +29,23 @@ services:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
 
+  dashboard:
+    build: ./dashboard
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://dashboard_ro:${DASHBOARD_DB_PASSWORD}@db:5432/trading_bot
+    depends_on:
+      db:
+        condition: service_healthy
+    # Bound to loopback only -- never reachable from the local network, let
+    # alone the public internet. Read-only role or not, no reason to expose
+    # it further than "the machine it's running on."
+    ports:
+      - "127.0.0.1:3000:3000"
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
 volumes:
   pgdata:
