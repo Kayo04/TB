@@ -44,7 +44,6 @@ cancellable at all.
 from __future__ import annotations
 import asyncio
 import logging
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -103,6 +102,7 @@ class LiveRunner:
         limits: RiskLimits,
         external: ExternalPositionSource,
         alert_sink: AlertSink,
+        heartbeat_conn: psycopg.Connection,
         config: Optional[RunnerConfig] = None,
     ):
         self.data_source = data_source
@@ -119,12 +119,15 @@ class LiveRunner:
         self._timeframe_delta = pd.Timedelta(timeframe)
         self._buffer_df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         self._buffer_df.index.name = "ts"
-        # _run_cycle_sync runs in a worker thread (via to_thread) while the
-        # heartbeat loop below writes from a *different* thread on its own
-        # ~60s cadence -- psycopg.Connection is not safe for concurrent use
-        # from two threads at once, so both paths serialize through this
-        # lock before touching self.conn.
-        self._conn_lock = threading.Lock()
+        # A genuinely SEPARATE connection, not a lock around self.conn. This
+        # was tried as a shared-lock design first and caused a real bug: a
+        # hung cycle's abandoned worker thread (see the module docstring)
+        # holds the lock for as long as it runs, and heartbeat writes queued
+        # behind it defeats the entire point of the heartbeat -- staying
+        # visible precisely when cycles are stuck. Two independent
+        # Connection objects have no shared-object thread-safety concern, so
+        # heartbeats now never wait on cycle execution, hung or not.
+        self._heartbeat_conn = heartbeat_conn
         self._heartbeat_component = f"live_runner:{symbol}:{timeframe}"
         if self.config.stream_wait_timeout_seconds is not None:
             self._stream_wait_timeout_seconds = self.config.stream_wait_timeout_seconds
@@ -169,8 +172,7 @@ class LiveRunner:
                 pass
 
     def _write_heartbeat_sync(self, detail: str) -> None:
-        with self._conn_lock:
-            record_heartbeat(self.conn, component=self._heartbeat_component, detail=detail)
+        record_heartbeat(self._heartbeat_conn, component=self._heartbeat_component, detail=detail)
 
     async def _heartbeat_loop(self) -> None:
         """Writes a durable heartbeat row on a fixed ~60s cadence, independent
@@ -277,10 +279,6 @@ class LiveRunner:
             self._buffer_df = self._buffer_df.iloc[-warmup:]
 
     def _run_cycle_sync(self, bar: Bar) -> None:
-        with self._conn_lock:
-            self._run_cycle_locked(bar)
-
-    def _run_cycle_locked(self, bar: Bar) -> None:
         start = time.monotonic()
         was_halted = kill_switch.is_halted(self.conn)
         signal: Optional[int] = None

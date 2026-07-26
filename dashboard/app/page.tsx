@@ -1,11 +1,14 @@
-import RunLogTable from "@/components/RunLogTable";
-import TradeBlotter from "@/components/TradeBlotter";
+import CommandHeader from "@/components/CommandHeader";
+import PerformanceSection from "@/components/PerformanceSection";
 import EquityCurveChart from "@/components/EquityCurveChart";
+import ActivityPanel from "@/components/ActivityPanel";
+import TradeBlotter from "@/components/TradeBlotter";
 import PositionTable from "@/components/PositionTable";
 import ReconciliationTable from "@/components/ReconciliationTable";
 import RiskEventsTable from "@/components/RiskEventsTable";
-import CycleHealthPanel from "@/components/CycleHealthPanel";
-import HeartbeatStatus from "@/components/HeartbeatStatus";
+import RunLogTable from "@/components/RunLogTable";
+import StrategyExplained from "@/components/StrategyExplained";
+import Panel from "@/components/Panel";
 
 // This page must reflect live database state on every request -- never
 // statically cached or ISR'd.
@@ -14,38 +17,51 @@ export const dynamic = "force-dynamic";
 export default function DashboardPage() {
   return (
     <main>
-      <h1>Trading Bot -- Dashboard (paper)</h1>
+      <CommandHeader />
 
       <section>
-        <h2>O que decidiu</h2>
-        <h3>Histórico de ciclos</h3>
-        <RunLogTable />
-        <h3>Blotter de trades</h3>
-        <TradeBlotter />
-        <h3>Curva de equity</h3>
-        <EquityCurveChart />
+        <h2>Desempenho</h2>
+        <PerformanceSection />
+      </section>
+
+      <section>
+        <h2>Curva &amp; atividade</h2>
+        <div className="grid-2">
+          <EquityCurveChart />
+          <ActivityPanel />
+        </div>
       </section>
 
       <section>
         <h2>Estado ao vivo</h2>
-        <h3>Heartbeat</h3>
-        <HeartbeatStatus />
-        <h3>Posições</h3>
-        <PositionTable />
-        <p style={{ fontSize: "0.85em", color: "#666" }}>
-          Halted/não-halted mostrado na barra do topo.
-        </p>
+        <Panel title="Blotter de trades (todos os fills)">
+          <TradeBlotter />
+        </Panel>
+        <Panel title="Posições">
+          <PositionTable />
+        </Panel>
       </section>
 
       <section>
         <h2>Saúde do sistema</h2>
-        <h3>Reconciliação</h3>
-        <ReconciliationTable />
-        <h3>Histórico do kill-switch</h3>
-        <RiskEventsTable />
-        <h3>Timing dos ciclos</h3>
-        <CycleHealthPanel />
+        <div className="grid-2">
+          <Panel title="Reconciliação">
+            <ReconciliationTable />
+          </Panel>
+          <Panel title="Histórico do kill-switch">
+            <RiskEventsTable />
+          </Panel>
+        </div>
+        <Panel title="Histórico de ciclos">
+          <RunLogTable />
+        </Panel>
       </section>
+
+      <section>
+        <StrategyExplained />
+      </section>
+
+      <footer className="page-footer">trading-bot &middot; dashboard read-only (dashboard_ro)</footer>
     </main>
   );
 }

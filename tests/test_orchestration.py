@@ -18,6 +18,7 @@ from bot.data.base import Bar
 from bot.execution.base import Transition
 from bot.execution.paper_broker import PaperBroker
 from bot.execution.transitions import order_from_transition
+from bot.persistence.db import get_connection
 from bot.persistence.reconciliation import LedgerPositionSource
 from bot.risk.base import RiskLimits
 from bot.risk.gate import RiskGate, StaticMarkPriceSource
@@ -110,6 +111,10 @@ def _make_runner(strategy, db_conn, data_source=None, limits=None, config=None) 
     mark_prices = StaticMarkPriceSource()
     limits = limits or RiskLimits()
     broker = RiskGate(PaperBroker(db_conn), db_conn, limits, mark_prices)
+    # A real, separate connection -- not db_conn again -- so tests exercise
+    # the same "heartbeat never blocks on cycle execution" guarantee as
+    # production (see LiveRunner's constructor docstring).
+    heartbeat_conn = get_connection(autocommit=True)
     return LiveRunner(
         data_source=data_source,
         strategy=strategy,
@@ -121,6 +126,7 @@ def _make_runner(strategy, db_conn, data_source=None, limits=None, config=None) 
         limits=limits,
         external=LedgerPositionSource(db_conn),
         alert_sink=LogAlertSink(),
+        heartbeat_conn=heartbeat_conn,
         config=config,
     ), broker
 

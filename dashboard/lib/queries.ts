@@ -47,6 +47,69 @@ export async function getRecentFills(limit = 50): Promise<FillRow[]> {
   return rows;
 }
 
+// Unbounded on purpose: trade-pairing (lib/tradeStats.ts) needs every fill
+// ever recorded to compute lifetime P&L/win-rate correctly, not just a
+// recent page. Fee/fill-count history is small (one row per order
+// execution), so this is cheap for as long as this stays a single-symbol
+// paper bot -- revisit if that assumption ever changes.
+export async function getAllFills(): Promise<FillRow[]> {
+  const { rows } = await pool.query<FillRow>("SELECT * FROM fills ORDER BY filled_ts ASC, fill_id ASC");
+  return rows;
+}
+
+export type LatestEquity = { totalEquity: number; recordedAt: string } | null;
+
+export async function getLatestEquity(): Promise<LatestEquity> {
+  const { rows } = await pool.query<{ total_equity: number; recorded_at: string }>(
+    "SELECT total_equity, recorded_at FROM equity_snapshots ORDER BY recorded_at DESC LIMIT 1"
+  );
+  const row = rows[0];
+  return row ? { totalEquity: row.total_equity, recordedAt: row.recorded_at } : null;
+}
+
+export type CycleActivity = {
+  totalCycles: number;
+  byDecision: Record<string, number>;
+  monitoringSince: string | null;
+  lastCycleAt: string | null;
+  avgDurationMs24h: number | null;
+};
+
+// monitoringSince is the earliest run_log row, NOT true process uptime --
+// heartbeat is a single upserted row with no history, so past restarts
+// aren't visible from current tables. Labelled honestly wherever it's
+// rendered (ActivityPanel) rather than called "uptime". Supersedes the old
+// getCycleHealth() (folded avgDurationMs in here; failedLast24h dropped in
+// favor of the lifetime cycle_failed breakdown below, which is more useful
+// than the same count windowed two different ways).
+export async function getCycleActivity(): Promise<CycleActivity> {
+  const [{ rows: byDecisionRows }, { rows: rangeRows }, { rows: avgRows }] = await Promise.all([
+    pool.query<{ decision: string; c: string }>("SELECT decision, COUNT(*) AS c FROM run_log GROUP BY decision"),
+    pool.query<{ since: string | null; last: string | null }>(
+      "SELECT MIN(created_at) AS since, MAX(created_at) AS last FROM run_log"
+    ),
+    pool.query<{ avg_ms: string | null }>(
+      "SELECT AVG(cycle_duration_ms) AS avg_ms FROM run_log WHERE created_at > now() - interval '24 hours'"
+    ),
+  ]);
+
+  const byDecision: Record<string, number> = {};
+  let totalCycles = 0;
+  for (const row of byDecisionRows) {
+    const count = Number(row.c);
+    byDecision[row.decision] = count;
+    totalCycles += count;
+  }
+
+  return {
+    totalCycles,
+    byDecision,
+    avgDurationMs24h: avgRows[0]?.avg_ms != null ? Number(avgRows[0].avg_ms) : null,
+    monitoringSince: rangeRows[0]?.since ?? null,
+    lastCycleAt: rangeRows[0]?.last ?? null,
+  };
+}
+
 export type EquitySnapshotRow = {
   snapshot_id: string;
   total_equity: number;
@@ -64,6 +127,13 @@ export async function getEquityCurve(limit = 500): Promise<EquitySnapshotRow[]> 
     [limit]
   );
   return rows;
+}
+
+export async function getStrategyName(): Promise<string | null> {
+  const { rows } = await pool.query<{ strategy_name: string }>(
+    "SELECT strategy_name FROM orders ORDER BY created_at DESC LIMIT 1"
+  );
+  return rows[0]?.strategy_name ?? null;
 }
 
 export type PositionRow = { symbol: string; position: number };
@@ -140,36 +210,3 @@ export async function getHeartbeat(): Promise<HeartbeatRow | null> {
   return { component: row.component, detail: row.detail, lastSeenAt: row.last_seen_at };
 }
 
-export type CycleHealth = {
-  lastCycleAt: string | null;
-  minutesSinceLastCycle: number | null;
-  avgDurationMs: number | null;
-  failedLast24h: number;
-};
-
-export async function getCycleHealth(): Promise<CycleHealth> {
-  const [{ rows: lastRows }, { rows: avgRows }, { rows: failRows }] = await Promise.all([
-    pool.query<{ created_at: string }>(
-      "SELECT created_at FROM run_log ORDER BY created_at DESC LIMIT 1"
-    ),
-    pool.query<{ avg_ms: string | null }>(
-      "SELECT AVG(cycle_duration_ms) AS avg_ms FROM run_log WHERE created_at > now() - interval '24 hours'"
-    ),
-    pool.query<{ c: string }>(
-      "SELECT COUNT(*) AS c FROM run_log WHERE decision = 'cycle_failed' AND created_at > now() - interval '24 hours'"
-    ),
-  ]);
-
-  const lastCycleAt = lastRows[0]?.created_at ?? null;
-  const minutesSinceLastCycle = lastCycleAt
-    ? Math.round((Date.now() - new Date(lastCycleAt).getTime()) / 60000)
-    : null;
-  const avgDurationMs = avgRows[0]?.avg_ms != null ? Number(avgRows[0].avg_ms) : null;
-
-  return {
-    lastCycleAt,
-    minutesSinceLastCycle,
-    avgDurationMs,
-    failedLast24h: Number(failRows[0]?.c ?? 0),
-  };
-}

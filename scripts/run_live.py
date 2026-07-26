@@ -46,6 +46,10 @@ EXCHANGE = "binance"
 if __name__ == "__main__":
     logger.info("run_live starting: symbol=%s timeframe=%s exchange=%s", SYMBOL, TIMEFRAME, EXCHANGE)
     conn = get_connection(autocommit=True)
+    # Separate connection for the heartbeat background task -- see
+    # LiveRunner's docstring/constructor. Must be a distinct Connection
+    # object, not just a distinct reference to the same one.
+    heartbeat_conn = get_connection(autocommit=True)
     run_migrations(conn)
     logger.info("migrations applied, constructing runner")
 
@@ -66,6 +70,7 @@ if __name__ == "__main__":
         limits=limits,
         external=LedgerPositionSource(conn),
         alert_sink=LogAlertSink(),
+        heartbeat_conn=heartbeat_conn,
     )
     runner.seed_from_history()
     asyncio.run(runner.run_forever())
