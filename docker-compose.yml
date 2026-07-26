@@ -23,6 +23,11 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/trading_bot
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # See scripts/run_live.py for why this isn't left at RiskLimits'
+      # conservative 0.05 default -- placeholder qty=1.0 sizing, not a
+      # relaxed real-money risk tolerance. Defaults to the safe 0.05 here
+      # too if unset, matching the Python-level fallback (defense in depth).
+      MAX_DAILY_DRAWDOWN_PCT: ${MAX_DAILY_DRAWDOWN_PCT:-0.05}
     depends_on:
       db:
         condition: service_healthy

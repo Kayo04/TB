@@ -43,6 +43,18 @@ SYMBOL = "BTC/USDT"
 TIMEFRAME = "1h"
 EXCHANGE = "binance"
 
+# RiskLimits.max_daily_drawdown_pct defaults to a conservative 5% (see
+# bot/risk/base.py) -- appropriate once real position sizing exists. Today
+# qty is still a fixed 1.0-unit placeholder (see bot/execution/transitions.py),
+# so daily equity is just one position's raw P&L against a tiny cash-flow
+# base that resets to ~0 every UTC day -- ordinary BTC noise routinely swings
+# that base by 30-100%+ in percentage terms, tripping the kill-switch on
+# noise rather than a real problem (see PROGRESS.md for the live incident
+# that prompted this). Overridable via env so recalibrating doesn't need a
+# code change; MUST be revisited once real sizing exists, since a wide
+# threshold against a *real* capital base is not the same risk decision.
+MAX_DAILY_DRAWDOWN_PCT = float(os.environ.get("MAX_DAILY_DRAWDOWN_PCT", "0.05"))
+
 if __name__ == "__main__":
     logger.info("run_live starting: symbol=%s timeframe=%s exchange=%s", SYMBOL, TIMEFRAME, EXCHANGE)
     conn = get_connection(autocommit=True)
@@ -56,7 +68,8 @@ if __name__ == "__main__":
     strategy = MACrossoverStrategy(fast=20, slow=50)
     data_source = CcxtDataSource(exchange=EXCHANGE)
     mark_prices = StaticMarkPriceSource()
-    limits = RiskLimits()
+    limits = RiskLimits(max_daily_drawdown_pct=MAX_DAILY_DRAWDOWN_PCT)
+    logger.info("risk limits: max_daily_drawdown_pct=%.2f (env MAX_DAILY_DRAWDOWN_PCT)", MAX_DAILY_DRAWDOWN_PCT)
     broker = RiskGate(PaperBroker(conn), conn, limits, mark_prices)
 
     runner = LiveRunner(

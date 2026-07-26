@@ -506,16 +506,86 @@ indefinidamente, apesar do processo estar vivo e sem erros nos logs.
 - **Heartbeat durável** (tabela `heartbeat`, migration `0005`): distinto de `run_log` -- esse só
   ganha linha nova quando um bar fecha (até 1x/timeframe, 1x/hora aqui); heartbeat é escrito por
   `LiveRunner` a cada ~60s independentemente da atividade de bars, via task assíncrona em
-  background. Serializado com `_run_cycle_sync` por um `threading.Lock` -- `psycopg.Connection`
-  não é seguro para uso concorrente por duas threads, e a task de heartbeat corre em thread
-  diferente da do ciclo (`asyncio.to_thread` em ambos). Visível no dashboard: painel "Heartbeat"
-  em "Estado ao vivo", "última atividade: há Xs", distinto do "último ciclo" do
-  `CycleHealthPanel` -- objetivo explícito do dono era distinguir "à espera, saudável" de
-  "preso, silenciosamente" sem esperar até 1h por um bar.
+  background. Visível no dashboard: painel "Heartbeat" em "Estado ao vivo", "última atividade: há
+  Xs", distinto do "último ciclo" -- objetivo explícito do dono era distinguir "à espera,
+  saudável" de "preso, silenciosamente" sem esperar até 1h por um bar.
+  **Correção (2026-07-26, ver sessão da redesign da dashboard abaixo)**: o design original
+  serializava a escrita do heartbeat com `_run_cycle_sync` via `threading.Lock` partilhado --
+  `test_hung_cycle_hits_timeout_and_loop_moves_on` ficou pendurado indefinidamente numa corrida de
+  rotina, porque threads de ciclo abandonadas (o mesmo caso patológico descrito acima) ficam à
+  espera desse lock, e o heartbeat fica em fila atrás delas -- anulando o próprio propósito do
+  heartbeat (continuar visível exatamente quando os ciclos estão presos). Corrigido para uma
+  **ligação Postgres própria e separada** para o heartbeat (`LiveRunner` recebe agora
+  `heartbeat_conn` explícito) -- duas ligações distintas não têm problema de concorrência entre
+  si, ao contrário de duas threads a partilhar a mesma ligação.
 - **45/45 testes a passar** (43 anteriores + 1 novo de regressão + `heartbeat` acrescentado ao
   `TRUNCATE` do fixture `db_conn`). `.env` local precisou de `DATABASE_URL` reposto (tinha sido
   perdido quando o milestone 6/dashboard reescreveu o ficheiro só com os secrets do
   docker-compose) -- documentado inline no próprio `.env`, não escondido.
+
+### Redesign da dashboard: métricas de trading, tema visual HUD, explicação da estratégia (2026-07-26)
+Só leitura via `dashboard_ro`, zero mudanças a lógica de trading/risco -- queries novas
+SELECT-only sobre tabelas já existentes (`fills`, `run_log`, `equity_snapshots`, `heartbeat`,
+`orders`), sem migration nova.
+- **`dashboard/lib/tradeStats.ts`**: pareamento de trades round-trip a partir de `fills`, via
+  `ROW_NUMBER`. Exato dado o invariante atual (símbolo único, qty fixa, posição binária flat/long
+  -- fills têm de alternar buy/sell estritamente). Esse invariante **não é garantido pelo
+  schema**, por isso o pareamento valida-o a cada fill: uma alternação quebrada ou uma qty
+  diferente da de referência para de confiar no pareamento desse símbolo exatamente nesse fill,
+  regista alto (`console.error`, visível em `docker compose logs dashboard`) e mostra um banner de
+  anomalia visível na UI -- nunca um número silenciosamente errado. Win/loss/breakeven como três
+  buckets explícitos (decisão do dono). "A monitorizar desde" + idade do heartbeat mostrados como
+  proxy honesto de atividade, nunca chamados "uptime" -- `heartbeat` não tem histórico, por isso
+  restarts passados não são deriváveis das tabelas atuais.
+- **Tema visual**: dark-only por decisão deliberada (HUD não tem "modo claro"; ferramenta
+  single-user local, um toggle tinha pouco valor). Paleta cyan/orange validada com o
+  color-contrast/CVD checker do projeto contra a própria superfície escura da dashboard antes de
+  ser escolhida -- não escolhida a olho. Cores de estado (good/warning/critical) mantidas como
+  escala fixa separada da paleta cyan/orange do P&L, de propósito -- uma cor de P&L nunca deve
+  também significar saúde do sistema. Zero dependências novas -- só CSS + a stack de fontes do
+  sistema, `recharts` já existente.
+- **Componentes novos**: `CommandHeader`, `PerformanceSection`, `ClosedTradesTable`,
+  `ActivityPanel`, `StrategyExplained` (explicação em linguagem simples do MA crossover,
+  explícito que é um placeholder que não bate buy & hold -- o valor do projeto é a engenharia, não
+  esta estratégia). `CycleHealthPanel`/`HeartbeatStatus` reformados em `ActivityPanel`/
+  `CommandHeader`.
+- **Bug real apanhado ao reconstruir**: ver correção do heartbeat na secção do milestone acima --
+  apanhado por uma corrida de testes de rotina antes de mexer no código da dashboard, não
+  intencional.
+- **45/45 testes a passar.**
+
+### Calibração do kill-switch de drawdown diário para sizing placeholder (2026-07-26)
+Primeira corrida live suficientemente longa para o kill-switch disparar contra movimento real de
+preço -- prova ao vivo do gate do milestone 4, não um bug.
+- **O que aconteceu**: às 07:00 UTC o sinal virou 0→1 (golden cross), o bot comprou 1 BTC/USDT a
+  $64,402. Equity do dia chegou ao pico de **$71.41** às 09:00. O preço recuou; às 11:00 a equity
+  tinha caído para $40.76 -- um drawdown de 42.9% sobre esse pico, acima do limite de 5%
+  (`max_daily_drawdown_pct` default) -- o risk layer parou o bot. Ficou halted (3 disparos
+  registados em `risk_events`, o check corre e regista de novo a cada ciclo enquanto continua
+  acima do limite).
+- **Porque é que a percentagem parece tão dramática**: `qty` continua fixa em 1.0 (placeholder,
+  sizing real ainda não construído -- ver milestone 2). "Equity" aqui é só o P&L de uma posição,
+  não uma base de capital real. Uma oscilação de $71 → $40 é ruído normal do BTC em termos de
+  dólares, mas contra uma base tão pequena lê-se como uma percentagem enorme. Não é sinal de nada
+  partido -- é um artefacto conhecido do sizing placeholder.
+- **Decisão**: `max_daily_drawdown_pct` subido de 0.05 (5%, default conservador de
+  `RiskLimits`) para **0.90 (90%)**, só para este deployment, via `MAX_DAILY_DRAWDOWN_PCT` no
+  `.env` (nunca commitado) -- `RiskLimits`' próprio default no código fica em 0.05, inalterado,
+  continua conservador para quem instanciar a classe sem override. 90% tolera as oscilações
+  observadas (42.9%, 28.01%) mas ainda apanharia um esvaziamento genuíno da equity para perto de
+  zero (chegou a acontecer: 99.88% de drawdown num dos disparos) -- não é desligar a segurança, é
+  calibrar o limiar à realidade do sizing placeholder. **Só faz sentido enquanto `qty` for
+  placeholder** -- um limiar largo destes contra uma base de capital real seria uma decisão de
+  risco completamente diferente; revisitar quando existir sizing real (nota deixada também em
+  `scripts/run_live.py` e `.env.prod.example`).
+- **Halt limpo manualmente** via `docker compose exec bot python scripts/clear_halt.py "tiago"
+  "..."` -- único caminho que pode limpar um halt, por desenho (milestone 4). Confirmado limpo:
+  `risk_events` tem a linha `clear`, dashboard mostra "kill switch não está ativo".
+- **Achado à parte, não relacionado com este trabalho**: o container standalone
+  `trading-bot-postgres-test` (usado por pytest) tinha crashado silenciosamente ~8h antes desta
+  sessão (`docker ps -a` mostrava `Exited (255)`), fazendo os testes ficarem pendurados a tentar
+  ligar a uma porta morta em vez de falhar rápido. `docker start trading-bot-postgres-test`
+  resolveu; não é um bug do projeto, é higiene do ambiente local.
 
 ## TODO imediato
 - [ ] (Futuro) Upgrade da dashboard para Next.js 16 -- limpa os CVEs conhecidos da série 14.x;
@@ -529,3 +599,6 @@ indefinidamente, apesar do processo estar vivo e sem erros nos logs.
       milestone 6.
 - [ ] (Futuro, pré-requisito do gate) Split out-of-sample / walk-forward no backtester.
 - [ ] (Futuro) Avaliar Kraken (MiCA) como venue de dados/execução em alternativa à Binance.
+- [ ] (Revisitar com sizing real) `MAX_DAILY_DRAWDOWN_PCT=0.90` no `.env` é calibrado para
+      qty=1.0 placeholder -- ver nota 2026-07-26. Não copiar este valor para um deployment com
+      sizing real sem reavaliar.
